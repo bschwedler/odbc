@@ -13,11 +13,13 @@
 #pragma warning(disable : 4996) // warning about deprecated declaration
 #endif
 
-#include "nanodbc.h"
+#include <nanodbc/nanodbc.h>
 
 #include <algorithm>
 #include <clocale>
+#include <codecvt>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
@@ -28,14 +30,16 @@
 #include <cstdint>
 #endif
 
-// User may redefine NANODBC_ASSERT macro in nanodbc.h
+// User may redefine NANODBC_ASSERT macro in nanodbc/nanodbc.h
 #ifndef NANODBC_ASSERT
 #include <cassert>
 #define NANODBC_ASSERT(expr) assert(expr)
 #endif
 
-#ifdef NANODBC_USE_BOOST_CONVERT
+#ifdef NANODBC_ENABLE_BOOST
 #include <boost/locale/encoding_utf.hpp>
+#elif defined(__GNUC__) && (__GNUC__ < 5)
+#include <cwchar>
 #else
 #include <codecvt>
 #endif
@@ -47,7 +51,7 @@
 
 #ifdef _WIN32
 // needs to be included above sql.h for windows
-#ifndef __MINGW32__
+#if !defined(__MINGW32__) && !defined(NOMINMAX)
 #define NOMINMAX
 #endif
 #include <windows.h>
@@ -60,7 +64,7 @@
 // Microsoft has -150 thru -199 reserved for Microsoft SQL Server Native Client driver usage.
 // Originally, defined in sqlncli.h (old SQL Server Native Client driver)
 // and msodbcsql.h (new Microsoft ODBC Driver for SQL Server)
-// See https://github.com/lexicalunit/nanodbc/issues/226
+// See https://github.com/nanodbc/nanodbc/issues/18
 #ifndef SQL_SS_VARIANT
 #define SQL_SS_VARIANT (-150)
 #endif
@@ -86,9 +90,15 @@
 #define SQL_SS_UDT (-151) // from sqlncli.h
 #endif
 
-#ifndef SQL_NVARCHAR
-#define SQL_NVARCHAR (-10)
+// SQL_SS_LENGTH_UNLIMITED is used to describe the max length of
+// VARCHAR(max), VARBINARY(max), NVARCHAR(max), and XML columns
+#ifndef SQL_SS_LENGTH_UNLIMITED
+#define SQL_SS_LENGTH_UNLIMITED (0)
 #endif
+
+// Max length of DBVARBINARY and DBVARCHAR, etc. +1 for zero byte
+// MSDN: Large value data types are those that exceed the maximum row size of 8 KB
+#define SQLSERVER_DBMAXCHAR (8000 + 1)
 
 // Default to ODBC version defined by NANODBC_ODBC_VERSION if provided.
 #ifndef NANODBC_ODBC_VERSION
@@ -113,7 +123,11 @@
 // MARK: Unicode -
 // clang-format on
 
-#ifdef NANODBC_USE_UNICODE
+// Import string types defined in header file, so we don't have to type nanodbc:: everywhere
+using nanodbc::wide_char_t;
+using nanodbc::wide_string;
+
+#ifdef NANODBC_ENABLE_UNICODE
 #define NANODBC_FUNC(f) f##W
 #define NANODBC_SQLCHAR SQLWCHAR
 #else
@@ -122,22 +136,18 @@
 #endif
 
 #ifdef NANODBC_USE_IODBC_WIDE_STRINGS
-typedef std::u32string wide_string_type;
 #define NANODBC_CODECVT_TYPE std::codecvt_utf8
 #else
 #ifdef _MSC_VER
-typedef std::wstring wide_string_type;
 #define NANODBC_CODECVT_TYPE std::codecvt_utf8_utf16
 #else
-typedef std::u16string wide_string_type;
 #define NANODBC_CODECVT_TYPE std::codecvt_utf8_utf16
 #endif
 #endif
-typedef wide_string_type::value_type wide_char_t;
 
 #if defined(_MSC_VER)
-#ifndef NANODBC_USE_UNICODE
-// Disable unicode in sqlucode.h on Windows when NANODBC_USE_UNICODE
+#ifndef NANODBC_ENABLE_UNICODE
+// Disable unicode in sqlucode.h on Windows when NANODBC_ENABLE_UNICODE
 // is not defined. This is required because unicode is enabled by
 // default on many Windows systems.
 #define SQL_NOUNICODEMAP
@@ -236,87 +246,112 @@ inline bool success(RETCODE rc)
     return rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO;
 }
 
-// Returns the array size.
-template <typename T, std::size_t N>
-inline std::size_t arrlen(T (&)[N])
+#if __cpp_lib_nonmember_container_access >= 201411 || _MSC_VER
+using std::size;
+#else
+template <class T, std::size_t N>
+constexpr std::size_t size(const T (&array)[N]) noexcept
 {
     return N;
 }
+#endif
 
-// Operates like strlen() on a character array.
-template <typename T, std::size_t N>
-inline std::size_t strarrlen(T (&a)[N])
+template <std::size_t N>
+inline std::size_t size(NANODBC_SQLCHAR const (&array)[N]) noexcept
 {
-    const T* s = &a[0];
-    std::size_t i = 0;
-    while (*s++ && i < N)
-        i++;
-    return i;
+    auto const n = std::char_traits<NANODBC_SQLCHAR>::length(array);
+    NANODBC_ASSERT(n < N);
+    return n < N ? n : N - 1;
 }
 
-inline void convert(const wide_string_type& in, std::string& out)
+template <class T>
+inline void convert(T const* beg, size_t n, std::basic_string<T>& out)
 {
-#ifdef NANODBC_USE_BOOST_CONVERT
-    using boost::locale::conv::utf_to_utf;
-    out = utf_to_utf<char>(in.c_str(), in.c_str() + in.size());
-#else
-// Workaround for confirmed bug in VS2015. See:
-// https://connect.microsoft.com/VisualStudio/Feedback/Details/1403302
-// https://social.msdn.microsoft.com/Forums/en-US/8f40dcd8-c67f-4eba-9134-a19b9178e481
-#if defined(_MSC_VER) && (_MSC_VER == 1900)
-    auto p = reinterpret_cast<unsigned short const*>(in.data());
-    out = std::wstring_convert<NANODBC_CODECVT_TYPE<unsigned short>, unsigned short>().to_bytes(
-        p, p + in.size());
-#else
-    out = std::wstring_convert<NANODBC_CODECVT_TYPE<wide_char_t>, wide_char_t>().to_bytes(in);
-#endif
-#endif
+    out.assign(beg, n);
 }
 
-#ifdef NANODBC_USE_UNICODE
-inline void convert(const std::string& in, wide_string_type& out)
+inline void convert(wide_char_t const* beg, size_t n, std::string& out)
 {
-#ifdef NANODBC_USE_BOOST_CONVERT
+#ifdef NANODBC_ENABLE_BOOST
     using boost::locale::conv::utf_to_utf;
-    out = utf_to_utf<wide_char_t>(in.c_str(), in.c_str() + in.size());
-// Workaround for confirmed bug in VS2015. See:
-// https://connect.microsoft.com/VisualStudio/Feedback/Details/1403302
-// https://social.msdn.microsoft.com/Forums/en-US/8f40dcd8-c67f-4eba-9134-a19b9178e481
+    out = utf_to_utf<char>(beg, beg + n);
 #elif defined(_MSC_VER) && (_MSC_VER == 1900)
-    auto s =
-        std::wstring_convert<NANODBC_CODECVT_TYPE<unsigned short>, unsigned short>().from_bytes(in);
+    // Workaround for confirmed bug in VS2015. See:
+    // https://connect.microsoft.com/VisualStudio/Feedback/Details/1403302
+    // https://social.msdn.microsoft.com/Forums/en-US/8f40dcd8-c67f-4eba-9134-a19b9178e481/vs-2015-rc-linker-stdcodecvt-error
+    // Why static? http://stackoverflow.com/questions/26196686/utf8-utf16-codecvt-poor-performance
+    static thread_local std::wstring_convert<NANODBC_CODECVT_TYPE<unsigned short>, unsigned short>
+        converter;
+    out = converter.to_bytes(
+        reinterpret_cast<unsigned short const*>(beg),
+        reinterpret_cast<unsigned short const*>(beg + n));
+#else
+    static thread_local std::wstring_convert<NANODBC_CODECVT_TYPE<wide_char_t>, wide_char_t>
+        converter;
+    out = converter.to_bytes(beg, beg + n);
+#endif
+}
+
+inline void convert(char const* beg, size_t n, wide_string& out)
+{
+#ifdef NANODBC_ENABLE_BOOST
+    using boost::locale::conv::utf_to_utf;
+    out = utf_to_utf<wide_char_t>(beg, beg + n);
+#elif defined(_MSC_VER) && (_MSC_VER == 1900)
+    // Workaround for confirmed bug in VS2015. See:
+    // https://connect.microsoft.com/VisualStudio/Feedback/Details/1403302
+    // https://social.msdn.microsoft.com/Forums/en-US/8f40dcd8-c67f-4eba-9134-a19b9178e481/vs-2015-rc-linker-stdcodecvt-error
+    // Why static? http://stackoverflow.com/questions/26196686/utf8-utf16-codecvt-poor-performance
+    static thread_local std::wstring_convert<NANODBC_CODECVT_TYPE<unsigned short>, unsigned short>
+        converter;
+    auto s = converter.from_bytes(beg, beg + n);
     auto p = reinterpret_cast<wide_char_t const*>(s.data());
     out.assign(p, p + s.size());
 #else
-    out = std::wstring_convert<NANODBC_CODECVT_TYPE<wide_char_t>, wide_char_t>().from_bytes(in);
+    static thread_local std::wstring_convert<NANODBC_CODECVT_TYPE<wide_char_t>, wide_char_t>
+        converter;
+    out = converter.from_bytes(beg, beg + n);
 #endif
 }
 
-inline void convert(const wide_string_type& in, wide_string_type& out)
+template <class T>
+inline void convert(char const* beg, std::basic_string<T>& out)
 {
-    out = in;
+    convert(beg, std::strlen(beg), out);
 }
-#else
-inline void convert(const std::string& in, std::string& out)
+
+template <class T>
+inline void convert(wchar_t const* beg, std::basic_string<T>& out)
 {
-    out = in;
+    convert(beg, std::wcslen(beg), out);
 }
-#endif
+
+template <class T>
+inline void convert(std::basic_string<T>&& in, std::basic_string<T>& out)
+{
+    out.assign(in);
+}
+
+template <class T, class U>
+inline void convert(std::basic_string<T> const& in, std::basic_string<U>& out)
+{
+    convert(in.data(), in.size(), out);
+}
 
 // Attempts to get the most recent ODBC error as a string.
 // Always returns std::string, even in unicode mode.
 inline std::string
 recent_error(SQLHANDLE handle, SQLSMALLINT handle_type, long& native, std::string& state)
 {
-    nanodbc::string_type result;
+    nanodbc::string result;
     std::string rvalue;
     std::vector<NANODBC_SQLCHAR> sql_message(SQL_MAX_MESSAGE_LENGTH);
     sql_message[0] = '\0';
 
     SQLINTEGER i = 1;
-    SQLINTEGER native_error;
-    SQLSMALLINT total_bytes;
-    NANODBC_SQLCHAR sql_state[6];
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT total_bytes = 0;
+    NANODBC_SQLCHAR sql_state[6] = {0};
     RETCODE rc;
 
     do
@@ -334,7 +369,7 @@ recent_error(SQLHANDLE handle, SQLSMALLINT handle_type, long& native, std::strin
             &total_bytes);
 
         if (success(rc) && total_bytes > 0)
-            sql_message.resize(total_bytes + 1);
+            sql_message.resize(static_cast<std::size_t>(total_bytes) + 1);
 
         if (rc == SQL_NO_DATA)
             break;
@@ -353,14 +388,14 @@ recent_error(SQLHANDLE handle, SQLSMALLINT handle_type, long& native, std::strin
 
         if (!success(rc))
         {
-            convert(result, rvalue);
+            convert(std::move(result), rvalue);
             return rvalue;
         }
 
         if (!result.empty())
             result += ' ';
 
-        result += nanodbc::string_type(sql_message.begin(), sql_message.end());
+        result += nanodbc::string(sql_message.begin(), sql_message.end());
         i++;
 
 // NOTE: unixODBC using PostgreSQL and SQLite drivers crash if you call SQLGetDiagRec()
@@ -371,8 +406,17 @@ recent_error(SQLHANDLE handle, SQLSMALLINT handle_type, long& native, std::strin
 #endif
     } while (rc != SQL_NO_DATA);
 
-    convert(result, rvalue);
-    state = std::string(&sql_state[0], &sql_state[arrlen(sql_state) - 1]);
+    convert(std::move(result), rvalue);
+    if (size(sql_state) > 0)
+    {
+        state.clear();
+        state.reserve(size(sql_state) - 1);
+        for (std::size_t idx = 0; idx != size(sql_state) - 1; ++idx)
+        {
+            state.push_back(static_cast<char>(sql_state[idx]));
+        }
+    }
+
     native = native_error;
     std::string status = state;
     status += ": ";
@@ -387,6 +431,7 @@ recent_error(SQLHANDLE handle, SQLSMALLINT handle_type, long& native, std::strin
 
 } // namespace
 
+#ifndef NANODBC_DISABLE_NANODBC_NAMESPACE_FOR_INTERNAL_TESTS
 namespace nanodbc
 {
 
@@ -395,7 +440,7 @@ type_incompatible_error::type_incompatible_error()
 {
 }
 
-const char* type_incompatible_error::what() const NANODBC_NOEXCEPT
+const char* type_incompatible_error::what() const noexcept
 {
     return std::runtime_error::what();
 }
@@ -405,7 +450,7 @@ null_access_error::null_access_error()
 {
 }
 
-const char* null_access_error::what() const NANODBC_NOEXCEPT
+const char* null_access_error::what() const noexcept
 {
     return std::runtime_error::what();
 }
@@ -415,7 +460,7 @@ index_range_error::index_range_error()
 {
 }
 
-const char* index_range_error::what() const NANODBC_NOEXCEPT
+const char* index_range_error::what() const noexcept
 {
     return std::runtime_error::what();
 }
@@ -425,12 +470,12 @@ programming_error::programming_error(const std::string& info)
 {
 }
 
-const char* programming_error::what() const NANODBC_NOEXCEPT
+const char* programming_error::what() const noexcept
 {
     return std::runtime_error::what();
 }
 
-database_error::database_error(void* handle, short handle_type, const std::string& info)
+database_error::database_error(SQLHANDLE handle, short handle_type, const std::string& info)
     : std::runtime_error(info)
     , native_error(0)
     , sql_state("00000")
@@ -439,17 +484,17 @@ database_error::database_error(void* handle, short handle_type, const std::strin
               recent_error(handle, handle_type, native_error, sql_state);
 }
 
-const char* database_error::what() const NANODBC_NOEXCEPT
+const char* database_error::what() const noexcept
 {
     return message.c_str();
 }
 
-const long database_error::native() const NANODBC_NOEXCEPT
+long database_error::native() const noexcept
 {
     return native_error;
 }
 
-const std::string database_error::state() const NANODBC_NOEXCEPT
+const std::string database_error::state() const noexcept
 {
     return sql_state;
 }
@@ -458,9 +503,14 @@ const std::string database_error::state() const NANODBC_NOEXCEPT
 
 // Throwing exceptions using NANODBC_THROW_DATABASE_ERROR enables file name
 // and line numbers to be inserted into the error message. Useful for debugging.
+#ifdef NANODBC_THROW_NO_SOURCE_LOCATION
+#define NANODBC_THROW_DATABASE_ERROR(handle, handle_type)                                          \
+    throw nanodbc::database_error(handle, handle_type, "ODBC database error: ") /**/
+#else
 #define NANODBC_THROW_DATABASE_ERROR(handle, handle_type)                                          \
     throw nanodbc::database_error(                                                                 \
         handle, handle_type, __FILE__ ":" NANODBC_STRINGIZE(__LINE__) ": ") /**/
+#endif
 
 // clang-format off
 // 8888888b.           888             d8b 888
@@ -577,23 +627,27 @@ struct sql_ctype<double>
 };
 
 template <>
-struct sql_ctype<nanodbc::string_type::value_type>
+struct sql_ctype<wide_string::value_type>
 {
-#ifdef NANODBC_USE_UNICODE
     static const SQLSMALLINT value = SQL_C_WCHAR;
-#else
-    static const SQLSMALLINT value = SQL_C_CHAR;
-#endif
 };
 
 template <>
-struct sql_ctype<nanodbc::string_type>
+struct sql_ctype<wide_string>
 {
-#ifdef NANODBC_USE_UNICODE
     static const SQLSMALLINT value = SQL_C_WCHAR;
-#else
+};
+
+template <>
+struct sql_ctype<std::string::value_type>
+{
     static const SQLSMALLINT value = SQL_C_CHAR;
-#endif
+};
+
+template <>
+struct sql_ctype<std::string>
+{
+    static const SQLSMALLINT value = SQL_C_CHAR;
 };
 
 template <>
@@ -632,6 +686,7 @@ public:
         , blob_(false)
         , cbdata_(0)
         , pdata_(0)
+        , bound_(false)
     {
     }
 
@@ -642,7 +697,7 @@ public:
     }
 
 public:
-    nanodbc::string_type name_;
+    nanodbc::string name_;
     short column_;
     SQLSMALLINT sqltype_;
     SQLULEN sqlsize_;
@@ -652,6 +707,7 @@ public:
     bool blob_;
     nanodbc::null_type* cbdata_;
     char* pdata_;
+    bool bound_;
 };
 
 // Encapsulates properties of statement parameter.
@@ -660,10 +716,10 @@ struct bound_parameter
 {
     bound_parameter() = default;
 
+    SQLULEN size_ = 0;       // SQL data size of column or expression inbytes or characters
     SQLUSMALLINT index_ = 0; // Zero-based index of parameter marker
     SQLSMALLINT iotype_ = 0; // Input/Output type of parameter
     SQLSMALLINT type_ = 0;   // SQL data type of parameter
-    SQLULEN size_ = 0;       // SQL data size of column or expression inbytes or characters
     SQLSMALLINT scale_ = 0;  // decimal digits of column or expression
 };
 
@@ -684,9 +740,23 @@ struct bound_buffer
     std::size_t value_size_ = 0; // Size of single value (max size). Zero, if ignored.
 };
 
-// Allocates the native ODBC handles.
-inline void allocate_environment_handle(SQLHENV& env)
+inline void deallocate_handle(SQLHANDLE& handle, short handle_type)
 {
+    if (!handle)
+        return;
+
+    RETCODE rc;
+    NANODBC_CALL_RC(SQLFreeHandle, rc, handle_type, handle);
+    if (!success(rc))
+        NANODBC_THROW_DATABASE_ERROR(handle, handle_type);
+    handle = nullptr;
+}
+
+inline void allocate_env_handle(SQLHENV& env)
+{
+    if (env)
+        return;
+
     RETCODE rc;
     NANODBC_CALL_RC(SQLAllocHandle, rc, SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
     if (!success(rc))
@@ -706,18 +776,19 @@ inline void allocate_environment_handle(SQLHENV& env)
     }
     catch (...)
     {
-        NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_ENV, env);
+        deallocate_handle(env, SQL_HANDLE_ENV);
         throw;
     }
 }
 
-inline void allocate_handle(SQLHENV& env, SQLHDBC& conn)
+inline void allocate_dbc_handle(SQLHDBC& conn, SQLHENV env)
 {
-    allocate_environment_handle(env);
+    NANODBC_ASSERT(env);
+    if (conn)
+        return;
 
     try
     {
-        NANODBC_ASSERT(env);
         RETCODE rc;
         NANODBC_CALL_RC(SQLAllocHandle, rc, SQL_HANDLE_DBC, env, &conn);
         if (!success(rc))
@@ -725,7 +796,7 @@ inline void allocate_handle(SQLHENV& env, SQLHDBC& conn)
     }
     catch (...)
     {
-        NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_ENV, env);
+        deallocate_handle(conn, SQL_HANDLE_DBC);
         throw;
     }
 }
@@ -757,60 +828,55 @@ public:
     connection_impl& operator=(const connection_impl&) = delete;
 
     connection_impl()
-        : env_(0)
-        , conn_(0)
+        : env_(nullptr)
+        , dbc_(nullptr)
         , connected_(false)
         , transactions_(0)
         , rollback_(false)
     {
-        allocate_handle(env_, conn_);
     }
 
-    connection_impl(
-        const string_type& dsn,
-        const string_type& user,
-        const string_type& pass,
-        long timeout)
-        : env_(0)
-        , conn_(0)
+    connection_impl(const string& dsn, const string& user, const string& pass, long timeout)
+        : env_(nullptr)
+        , dbc_(nullptr)
         , connected_(false)
         , transactions_(0)
         , rollback_(false)
     {
-        allocate_handle(env_, conn_);
+        allocate();
+
         try
         {
             connect(dsn, user, pass, timeout);
         }
         catch (...)
         {
-            NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_DBC, conn_);
-            NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_ENV, env_);
+            deallocate();
             throw;
         }
     }
 
-    connection_impl(const string_type& connection_string, long timeout)
-        : env_(0)
-        , conn_(0)
+    connection_impl(const string& connection_string, long timeout)
+        : env_(nullptr)
+        , dbc_(nullptr)
         , connected_(false)
         , transactions_(0)
         , rollback_(false)
     {
-        allocate_handle(env_, conn_);
+        allocate();
+
         try
         {
             connect(connection_string, timeout);
         }
         catch (...)
         {
-            NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_DBC, conn_);
-            NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_ENV, env_);
+            deallocate();
             throw;
         }
     }
 
-    ~connection_impl() NANODBC_NOEXCEPT
+    ~connection_impl() noexcept
     {
         try
         {
@@ -820,73 +886,95 @@ public:
         {
             // ignore exceptions thrown during disconnect
         }
-        NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_DBC, conn_);
-        NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_ENV, env_);
+        deallocate();
+    }
+
+    void allocate()
+    {
+        allocate_env_handle(env_);
+        allocate_dbc_handle(dbc_, env_);
+    }
+
+    void deallocate()
+    {
+        deallocate_handle(dbc_, SQL_HANDLE_DBC);
+        deallocate_handle(env_, SQL_HANDLE_ENV);
     }
 
 #if !defined(NANODBC_DISABLE_ASYNC) && defined(SQL_ATTR_ASYNC_DBC_EVENT)
     void enable_async(void* event_handle)
     {
+        NANODBC_ASSERT(dbc_);
+
         RETCODE rc;
         NANODBC_CALL_RC(
             SQLSetConnectAttr,
             rc,
-            conn_,
+            dbc_,
             SQL_ATTR_ASYNC_DBC_FUNCTIONS_ENABLE,
             (SQLPOINTER)SQL_ASYNC_DBC_ENABLE_ON,
             SQL_IS_INTEGER);
         if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
 
         NANODBC_CALL_RC(
-            SQLSetConnectAttr, rc, conn_, SQL_ATTR_ASYNC_DBC_EVENT, event_handle, SQL_IS_POINTER);
+            SQLSetConnectAttr, rc, dbc_, SQL_ATTR_ASYNC_DBC_EVENT, event_handle, SQL_IS_POINTER);
         if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
     }
 
     void async_complete()
     {
+        NANODBC_ASSERT(dbc_);
+
         RETCODE rc, arc;
-        NANODBC_CALL_RC(SQLCompleteAsync, rc, SQL_HANDLE_DBC, conn_, &arc);
+        NANODBC_CALL_RC(SQLCompleteAsync, rc, SQL_HANDLE_DBC, dbc_, &arc);
         if (!success(rc) || !success(arc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
 
         connected_ = true;
 
         NANODBC_CALL_RC(
             SQLSetConnectAttr,
             rc,
-            conn_,
+            dbc_,
             SQL_ATTR_ASYNC_DBC_FUNCTIONS_ENABLE,
             (SQLPOINTER)SQL_ASYNC_DBC_ENABLE_OFF,
             SQL_IS_INTEGER);
         if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
     }
 #endif // !NANODBC_DISABLE_ASYNC && SQL_ATTR_ASYNC_DBC_EVENT
 
     RETCODE connect(
-        const string_type& dsn,
-        const string_type& user,
-        const string_type& pass,
+        const string& dsn,
+        const string& user,
+        const string& pass,
         long timeout,
         void* event_handle = nullptr)
     {
+        allocate_env_handle(env_);
         disconnect();
 
+        deallocate_handle(dbc_, SQL_HANDLE_DBC);
+        allocate_dbc_handle(dbc_, env_);
+
         RETCODE rc;
-        NANODBC_CALL_RC(SQLFreeHandle, rc, SQL_HANDLE_DBC, conn_);
-        if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
-
-        NANODBC_CALL_RC(SQLAllocHandle, rc, SQL_HANDLE_DBC, env_, &conn_);
-        if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(env_, SQL_HANDLE_ENV);
-
-        NANODBC_CALL_RC(
-            SQLSetConnectAttr, rc, conn_, SQL_LOGIN_TIMEOUT, (SQLPOINTER)(std::intptr_t)timeout, 0);
-        if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+        if (timeout != 0)
+        {
+            // Avoid to set the timeout to 0 (no timeout).
+            // This is a workaround for the Oracle ODBC Driver (11.1), as this
+            // operation is not supported by the Driver.
+            NANODBC_CALL_RC(
+                SQLSetConnectAttr,
+                rc,
+                dbc_,
+                SQL_LOGIN_TIMEOUT,
+                (SQLPOINTER)(std::intptr_t)timeout,
+                0);
+            if (!success(rc))
+                NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
+        }
 
 #if !defined(NANODBC_DISABLE_ASYNC) && defined(SQL_ATTR_ASYNC_DBC_EVENT)
         if (event_handle != nullptr)
@@ -896,7 +984,7 @@ public:
         NANODBC_CALL_RC(
             NANODBC_FUNC(SQLConnect),
             rc,
-            conn_,
+            dbc_,
             (NANODBC_SQLCHAR*)dsn.c_str(),
             SQL_NTS,
             !user.empty() ? (NANODBC_SQLCHAR*)user.c_str() : 0,
@@ -904,7 +992,7 @@ public:
             !pass.empty() ? (NANODBC_SQLCHAR*)pass.c_str() : 0,
             SQL_NTS);
         if (!success(rc) && (event_handle == nullptr || rc != SQL_STILL_EXECUTING))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
 
         connected_ = success(rc);
 
@@ -912,23 +1000,30 @@ public:
     }
 
     RETCODE
-    connect(const string_type& connection_string, long timeout, void* event_handle = nullptr)
+    connect(const string& connection_string, long timeout, void* event_handle = nullptr)
     {
+        allocate_env_handle(env_);
         disconnect();
 
+        deallocate_handle(dbc_, SQL_HANDLE_DBC);
+        allocate_dbc_handle(dbc_, env_);
+
         RETCODE rc;
-        NANODBC_CALL_RC(SQLFreeHandle, rc, SQL_HANDLE_DBC, conn_);
-        if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
-
-        NANODBC_CALL_RC(SQLAllocHandle, rc, SQL_HANDLE_DBC, env_, &conn_);
-        if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(env_, SQL_HANDLE_ENV);
-
-        NANODBC_CALL_RC(
-            SQLSetConnectAttr, rc, conn_, SQL_LOGIN_TIMEOUT, (SQLPOINTER)(std::intptr_t)timeout, 0);
-        if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+        if (timeout != 0)
+        {
+            // Avoid to set the timeout to 0 (no timeout).
+            // This is a workaround for the Oracle ODBC Driver (11.1), as this
+            // operation is not supported by the Driver.
+            NANODBC_CALL_RC(
+                SQLSetConnectAttr,
+                rc,
+                dbc_,
+                SQL_LOGIN_TIMEOUT,
+                (SQLPOINTER)(std::intptr_t)timeout,
+                0);
+            if (!success(rc))
+                NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
+        }
 
 #if !defined(NANODBC_DISABLE_ASYNC) && defined(SQL_ATTR_ASYNC_DBC_EVENT)
         if (event_handle != nullptr)
@@ -938,7 +1033,7 @@ public:
         NANODBC_CALL_RC(
             NANODBC_FUNC(SQLDriverConnect),
             rc,
-            conn_,
+            dbc_,
             0,
             (NANODBC_SQLCHAR*)connection_string.c_str(),
             SQL_NTS,
@@ -947,7 +1042,7 @@ public:
             nullptr,
             SQL_DRIVER_NOPROMPT);
         if (!success(rc) && (event_handle == nullptr || rc != SQL_STILL_EXECUTING))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
 
         connected_ = success(rc);
 
@@ -961,16 +1056,16 @@ public:
         if (connected())
         {
             RETCODE rc;
-            NANODBC_CALL_RC(SQLDisconnect, rc, conn_);
+            NANODBC_CALL_RC(SQLDisconnect, rc, dbc_);
             if (!success(rc))
-                NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+                NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
         }
         connected_ = false;
     }
 
     std::size_t transactions() const { return transactions_; }
 
-    void* native_dbc_handle() const { return conn_; }
+    void* native_dbc_handle() const { return dbc_; }
 
     void* native_env_handle() const { return env_; }
 
@@ -979,15 +1074,15 @@ public:
     {
         return get_info_impl<T>(info_type);
     }
-    string_type dbms_name() const;
+    string dbms_name() const;
 
-    string_type dbms_version() const;
+    string dbms_version() const;
 
-    string_type driver_name() const;
+    string driver_name() const;
 
-    string_type database_name() const;
+    string database_name() const;
 
-    string_type catalog_name() const
+    string catalog_name() const
     {
         NANODBC_SQLCHAR name[SQL_MAX_OPTION_STRING_LENGTH] = {0};
         SQLINTEGER length(0);
@@ -995,14 +1090,14 @@ public:
         NANODBC_CALL_RC(
             NANODBC_FUNC(SQLGetConnectAttr),
             rc,
-            conn_,
+            dbc_,
             SQL_ATTR_CURRENT_CATALOG,
             name,
             sizeof(name) / sizeof(NANODBC_SQLCHAR),
             &length);
         if (!success(rc))
-            NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
-        return string_type(&name[0], &name[strarrlen(name)]);
+            NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
+        return string(&name[0], &name[size(name)]);
     }
 
     std::size_t ref_transaction() { return ++transactions_; }
@@ -1023,7 +1118,7 @@ private:
     T get_info_impl(short info_type) const;
 
     HENV env_;
-    HDBC conn_;
+    HDBC dbc_;
     bool connected_;
     std::size_t transactions_;
     bool rollback_; // if true, this connection is marked for eventual transaction rollback
@@ -1034,14 +1129,14 @@ T connection::connection_impl::get_info_impl(short info_type) const
 {
     T value;
     RETCODE rc;
-    NANODBC_CALL_RC(NANODBC_FUNC(SQLGetInfo), rc, conn_, info_type, &value, 0, nullptr);
+    NANODBC_CALL_RC(NANODBC_FUNC(SQLGetInfo), rc, dbc_, info_type, &value, 0, nullptr);
     if (!success(rc))
-        NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
+        NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
     return value;
 }
 
 template <>
-string_type connection::connection_impl::get_info_impl<string_type>(short info_type) const
+string connection::connection_impl::get_info_impl<string>(short info_type) const
 {
     NANODBC_SQLCHAR value[1024] = {0};
     SQLSMALLINT length(0);
@@ -1049,37 +1144,37 @@ string_type connection::connection_impl::get_info_impl<string_type>(short info_t
     NANODBC_CALL_RC(
         NANODBC_FUNC(SQLGetInfo),
         rc,
-        conn_,
+        dbc_,
         info_type,
         value,
         sizeof(value) / sizeof(NANODBC_SQLCHAR),
         &length);
     if (!success(rc))
-        NANODBC_THROW_DATABASE_ERROR(conn_, SQL_HANDLE_DBC);
-    return string_type(&value[0], &value[strarrlen(value)]);
+        NANODBC_THROW_DATABASE_ERROR(dbc_, SQL_HANDLE_DBC);
+    return string(&value[0], &value[size(value)]);
 }
 
-string_type connection::connection_impl::dbms_name() const
+string connection::connection_impl::dbms_name() const
 {
-    return get_info<string_type>(SQL_DBMS_NAME);
+    return get_info<string>(SQL_DBMS_NAME);
 }
 
-string_type connection::connection_impl::dbms_version() const
+string connection::connection_impl::dbms_version() const
 {
-    return get_info<string_type>(SQL_DBMS_VER);
+    return get_info<string>(SQL_DBMS_VER);
 }
 
-string_type connection::connection_impl::driver_name() const
+string connection::connection_impl::driver_name() const
 {
-    return get_info<string_type>(SQL_DRIVER_NAME);
+    return get_info<string>(SQL_DRIVER_NAME);
 }
 
-string_type connection::connection_impl::database_name() const
+string connection::connection_impl::database_name() const
 {
-    return get_info<string_type>(SQL_DATABASE_NAME);
+    return get_info<string>(SQL_DATABASE_NAME);
 }
 
-template string_type connection::get_info(short info_type) const;
+template string connection::get_info(short info_type) const;
 template unsigned short connection::get_info(short info_type) const;
 template uint32_t connection::get_info(short info_type) const;
 template uint64_t connection::get_info(short info_type) const;
@@ -1130,7 +1225,7 @@ public:
         conn_.ref_transaction();
     }
 
-    ~transaction_impl() NANODBC_NOEXCEPT
+    ~transaction_impl() noexcept
     {
         if (!committed_)
         {
@@ -1169,7 +1264,7 @@ public:
         }
     }
 
-    void rollback() NANODBC_NOEXCEPT
+    void rollback() noexcept
     {
         if (committed_)
             return;
@@ -1229,6 +1324,7 @@ public:
         , open_(false)
         , conn_()
         , bind_len_or_null_()
+        , wide_string_data_()
         , string_data_()
         , binary_data_()
 #if defined(NANODBC_DO_ASYNC_IMPL)
@@ -1240,11 +1336,12 @@ public:
         open(conn);
     }
 
-    statement_impl(class connection& conn, const string_type& query, long timeout)
+    statement_impl(class connection& conn, const string& query, long timeout)
         : stmt_(0)
         , open_(false)
         , conn_()
         , bind_len_or_null_()
+        , wide_string_data_()
         , string_data_()
         , binary_data_()
 #if defined(NANODBC_DO_ASYNC_IMPL)
@@ -1256,13 +1353,13 @@ public:
         prepare(conn, query, timeout);
     }
 
-    ~statement_impl() NANODBC_NOEXCEPT
+    ~statement_impl() noexcept
     {
         if (open() && connected())
         {
             NANODBC_CALL(SQLCancel, stmt_);
             reset_parameters();
-            NANODBC_CALL(SQLFreeHandle, SQL_HANDLE_STMT, stmt_);
+            deallocate_handle(stmt_, SQL_HANDLE_STMT);
         }
     }
 
@@ -1273,7 +1370,12 @@ public:
         NANODBC_CALL_RC(SQLAllocHandle, rc, SQL_HANDLE_STMT, conn.native_dbc_handle(), &stmt_);
         open_ = success(rc);
         if (!open_)
-            NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
+        {
+            if (!stmt_)
+                NANODBC_THROW_DATABASE_ERROR(conn.native_dbc_handle(), SQL_HANDLE_DBC);
+            else
+                NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
+        }
         conn_ = conn;
     }
 
@@ -1297,10 +1399,7 @@ public:
                 NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
 
             reset_parameters();
-
-            NANODBC_CALL_RC(SQLFreeHandle, rc, SQL_HANDLE_STMT, stmt_);
-            if (!success(rc))
-                NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
+            deallocate_handle(stmt_, SQL_HANDLE_STMT);
         }
 
         open_ = false;
@@ -1315,13 +1414,13 @@ public:
             NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
     }
 
-    void prepare(class connection& conn, const string_type& query, long timeout)
+    void prepare(class connection& conn, const string& query, long timeout)
     {
         open(conn);
         prepare(query, timeout);
     }
 
-    RETCODE prepare(const string_type& query, long timeout, void* event_handle = nullptr)
+    RETCODE prepare(const string& query, long timeout, void* event_handle = nullptr)
     {
         if (!open())
             throw programming_error("statement has no associated open connection");
@@ -1429,7 +1528,7 @@ public:
         }
     }
 
-    bool async_prepare(const string_type& query, void* event_handle, long timeout)
+    bool async_prepare(const string& query, void* event_handle, long timeout)
     {
         return async_helper(prepare(query, timeout, event_handle));
     }
@@ -1437,7 +1536,7 @@ public:
     bool async_execute_direct(
         class connection& conn,
         void* event_handle,
-        const string_type& query,
+        const string& query,
         long batch_operations,
         long timeout,
         statement& statement)
@@ -1475,12 +1574,12 @@ public:
 #endif
     result execute_direct(
         class connection& conn,
-        const string_type& query,
+        const string& query,
         long batch_operations,
         long timeout,
         statement& statement)
     {
-#ifdef NANODBC_HANDLE_NODATA_BUG
+#ifdef NANODBC_ENABLE_WORKAROUND_NODATA
         const RETCODE rc = just_execute_direct(conn, query, batch_operations, timeout, statement);
         if (rc == SQL_NO_DATA)
             return result();
@@ -1492,7 +1591,7 @@ public:
 
     RETCODE just_execute_direct(
         class connection& conn,
-        const string_type& query,
+        const string& query,
         long batch_operations,
         long timeout,
         statement&, // statement
@@ -1530,7 +1629,7 @@ public:
 
     result execute(long batch_operations, long timeout, statement& statement)
     {
-#ifdef NANODBC_HANDLE_NODATA_BUG
+#ifdef NANODBC_ENABLE_WORKAROUND_NODATA
         const RETCODE rc = just_execute(batch_operations, timeout, statement);
         if (rc == SQL_NO_DATA)
             return result();
@@ -1590,10 +1689,10 @@ public:
     }
 
     result procedure_columns(
-        const string_type& catalog,
-        const string_type& schema,
-        const string_type& procedure,
-        const string_type& column,
+        const string& catalog,
+        const string& schema,
+        const string& procedure,
+        const string& column,
         statement& statement)
     {
         if (!open())
@@ -1649,7 +1748,11 @@ public:
         return cols;
     }
 
-    void reset_parameters() NANODBC_NOEXCEPT { NANODBC_CALL(SQLFreeStmt, stmt_, SQL_RESET_PARAMS); }
+    void reset_parameters() noexcept
+    {
+        param_descr_data_.clear();
+        NANODBC_CALL(SQLFreeStmt, stmt_, SQL_RESET_PARAMS);
+    }
 
     short parameters() const
     {
@@ -1689,7 +1792,7 @@ public:
         if (!success(rc))
             NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
         NANODBC_ASSERT(
-            parameter_size <= static_cast<SQLULEN>(std::numeric_limits<unsigned long>::max()));
+            parameter_size < static_cast<SQLULEN>(std::numeric_limits<unsigned long>::max()));
         return static_cast<unsigned long>(parameter_size);
     }
 
@@ -1728,26 +1831,27 @@ public:
         disable_async();
 #endif
 
-        RETCODE rc;
-        SQLSMALLINT nullable; // unused
-        NANODBC_CALL_RC(
-            SQLDescribeParam,
-            rc,
-            stmt_,
-            param_index + 1,
-            &param.type_,
-            &param.size_,
-            &param.scale_,
-            &nullable);
-        if (!success(rc))
+        if (!param_descr_data_.count(param_index))
         {
-            // Fallback to binding as a varchar if SQLDescribeParam fails, will
-            // truncate data if it is longer than 256 characters, and may not
-            // work for all data types, but is necessary to support drivers
-            // which do not support SQLDescribeParam.
-            param.type_ = SQL_VARCHAR;
-            param.size_ = 256;
-            param.scale_ = 0;
+            RETCODE rc;
+            SQLSMALLINT nullable; // unused
+            NANODBC_CALL_RC(
+                SQLDescribeParam,
+                rc,
+                stmt_,
+                param_index + 1,
+                &param.type_,
+                &param.size_,
+                &param.scale_,
+                &nullable);
+            if (!success(rc))
+                NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
+        }
+        else
+        {
+            param.type_ = param_descr_data_[param_index].type_;
+            param.size_ = param_descr_data_[param_index].size_;
+            param.scale_ = param_descr_data_[param_index].scale_;
         }
 
         param.index_ = param_index;
@@ -1767,7 +1871,51 @@ public:
     }
 
     // calls actual ODBC bind parameter function
-    template <class T>
+    template <class T, typename std::enable_if<!is_character<T>::value, int>::type = 0>
+    void bind_parameter(bound_parameter const& param, bound_buffer<T>& buffer)
+    {
+        NANODBC_ASSERT(buffer.value_size_ > 0 || param.size_ > 0);
+
+        auto value_size{buffer.value_size_};
+        if (value_size == 0)
+            value_size = param.size_;
+
+        auto param_size{param.size_};
+        if (value_size > param_size)
+        {
+            // Parameter size reported by SQLDescribeParam for Large Objects:
+            // - For SQL VARBINARY(MAX), it is Zero which actually means SQL_SS_LENGTH_UNLIMITED.
+            // - For SQL UDT (eg. GEOMETRY), it may be driver-specific max limit (eg. SQL Server is
+            // DBMAXCHAR=8000 bytes).
+            // See MSDN for details
+            // https://docs.microsoft.com/en-us/sql/relational-databases/native-client/odbc/large-clr-user-defined-types-odbc
+            //
+            // If bound value is larger than parameter size, we force SQL_SS_LENGTH_UNLIMITED.
+            param_size = SQL_SS_LENGTH_UNLIMITED;
+        }
+
+        RETCODE rc;
+        NANODBC_CALL_RC(
+            SQLBindParameter,
+            rc,
+            stmt_,               // handle
+            param.index_ + 1,    // parameter number
+            param.iotype_,       // input or output type
+            sql_ctype<T>::value, // value type
+            param.type_,         // parameter type
+            param_size,          // column size ignored for many types, but needed for strings
+            param.scale_,        // decimal digits
+            (SQLPOINTER)buffer.values_, // parameter value
+            value_size,                 // buffer length
+            bind_len_or_null_[param.index_].data());
+
+        if (!success(rc))
+            NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
+    }
+
+    // Supports code like: query.bind(0, std_string.c_str())
+    // In this case, we need to pass nullptr to the final parameter of SQLBindParameter().
+    template <class T, typename std::enable_if<is_character<T>::value, int>::type = 0>
     void bind_parameter(bound_parameter const& param, bound_buffer<T>& buffer)
     {
         auto const buffer_size = buffer.value_size_ > 0 ? buffer.value_size_ : param.size_;
@@ -1785,7 +1933,7 @@ public:
             param.scale_,        // decimal digits
             (SQLPOINTER)buffer.values_, // parameter value
             buffer_size,                // buffer length
-            bind_len_or_null_[param.index_].data());
+            (buffer.size_ <= 1 ? nullptr : bind_len_or_null_[param.index_].data()));
 
         if (!success(rc))
             NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
@@ -1853,21 +2001,23 @@ public:
         bind_parameter(param, buffer);
     }
 
+    template <class T, typename = enable_if_character<T>>
     void bind_strings(
         param_direction direction,
         short param_index,
-        string_type::value_type const* values,
+        T const* values,
         std::size_t value_size,
         std::size_t batch_size,
         bool const* nulls = nullptr,
-        string_type::value_type const* null_sentry = nullptr);
+        T const* null_sentry = nullptr);
 
+    template <class T, typename = enable_if_string<T>>
     void bind_strings(
         param_direction direction,
         short param_index,
-        std::vector<string_type> const& values,
+        std::vector<T> const& values,
         bool const* nulls = nullptr,
-        string_type::value_type const* null_sentry = nullptr);
+        typename T::value_type const* null_sentry = nullptr);
 
     // handles multiple null values
     void bind_null(short param_index, std::size_t batch_size)
@@ -1893,6 +2043,26 @@ public:
             NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
     }
 
+    void describe_parameters(
+        const std::vector<short>& idx,
+        const std::vector<short>& type,
+        const std::vector<unsigned long>& size,
+        const std::vector<short>& scale)
+    {
+
+        if (idx.size() != type.size() || idx.size() != size.size() || idx.size() != scale.size())
+            throw programming_error("parameter description arrays are of different size");
+
+        for (std::size_t i = 0; i < idx.size(); ++i)
+        {
+            param_descr_data_[idx[i]].type_ = static_cast<SQLSMALLINT>(type[i]);
+            param_descr_data_[idx[i]].size_ = static_cast<SQLULEN>(size[i]);
+            param_descr_data_[idx[i]].scale_ = static_cast<SQLSMALLINT>(scale[i]);
+            param_descr_data_[idx[i]].index_ = static_cast<SQLUSMALLINT>(i);
+            param_descr_data_[idx[i]].iotype_ = PARAM_IN; // not used
+        }
+    }
+
     // comparator for null sentry values
     template <class T>
     bool equals(const T& lhs, const T& rhs)
@@ -1900,13 +2070,18 @@ public:
         return lhs == rhs;
     }
 
+    template <class T>
+    std::vector<T>& get_bound_string_data(short param_index);
+
 private:
     HSTMT stmt_;
     bool open_;
     class connection conn_;
     std::map<short, std::vector<null_type>> bind_len_or_null_;
-    std::map<short, std::vector<string_type::value_type>> string_data_;
+    std::map<short, std::vector<wide_string::value_type>> wide_string_data_;
+    std::map<short, std::vector<std::string::value_type>> string_data_;
     std::map<short, std::vector<uint8_t>> binary_data_;
+    std::map<short, bound_parameter> param_descr_data_;
 
 #if defined(NANODBC_DO_ASYNC_IMPL)
     bool async_;                 // true if statement is currently in SQL_STILL_EXECUTING mode
@@ -1915,34 +2090,6 @@ private:
     void* async_event_;          // currently active event handle for async notifications
 #endif
 };
-
-// Supports code like: query.bind(0, std_string.c_str())
-// In this case, we need to pass nullptr to the final parameter of SQLBindParameter().
-template <>
-void statement::statement_impl::bind_parameter<string_type::value_type>(
-    bound_parameter const& param,
-    bound_buffer<string_type::value_type>& buffer)
-{
-    auto const buffer_size = buffer.value_size_ > 0 ? buffer.value_size_ : param.size_;
-
-    RETCODE rc;
-    NANODBC_CALL_RC(
-        SQLBindParameter,
-        rc,
-        stmt_,                                     // handle
-        param.index_ + 1,                          // parameter number
-        param.iotype_,                             // input or output type
-        sql_ctype<string_type::value_type>::value, // value type
-        param.type_,                               // parameter type
-        param.size_,                // column size ignored for many types, but needed for strings
-        param.scale_,               // decimal digits
-        (SQLPOINTER)buffer.values_, // parameter value
-        buffer_size,                // buffer length
-        (buffer.size_ <= 1 ? nullptr : bind_len_or_null_[param.index_].data()));
-
-    if (!success(rc))
-        NANODBC_THROW_DATABASE_ERROR(stmt_, SQL_HANDLE_STMT);
-}
 
 template <class T>
 void statement::statement_impl::bind(
@@ -1972,13 +2119,16 @@ void statement::statement_impl::bind(
     bind_parameter(param, buffer);
 }
 
+template <class T, typename>
 void statement::statement_impl::bind_strings(
     param_direction direction,
     short param_index,
-    std::vector<string_type> const& values,
+    std::vector<T> const& values,
     bool const* nulls /*= nullptr*/,
-    string_type::value_type const* null_sentry /*= nullptr*/)
+    typename T::value_type const* null_sentry /*= nullptr*/)
 {
+    using string_vector = std::vector<typename T::value_type>;
+    string_vector& string_data = get_bound_string_data<typename T::value_type>(param_index);
 
     size_t const batch_size = values.size();
     bound_parameter param;
@@ -1992,32 +2142,24 @@ void statement::statement_impl::bind_strings(
     // add space for null terminator
     ++max_length;
 
-    string_data_[param_index] = std::vector<string_type::value_type>(batch_size * max_length, 0);
+    string_data = string_vector(batch_size * max_length, 0);
     for (std::size_t i = 0; i < batch_size; ++i)
     {
-        std::copy(
-            values[i].begin(),
-            values[i].end(),
-            string_data_[param_index].data() + (i * max_length));
+        std::copy(values[i].begin(), values[i].end(), string_data.data() + (i * max_length));
     }
     bind_strings(
-        direction,
-        param_index,
-        string_data_[param_index].data(),
-        max_length,
-        batch_size,
-        nulls,
-        null_sentry);
+        direction, param_index, string_data.data(), max_length, batch_size, nulls, null_sentry);
 }
 
+template <class T, typename>
 void statement::statement_impl::bind_strings(
     param_direction direction,
     short param_index,
-    string_type::value_type const* values,
+    T const* values,
     std::size_t value_size,
     std::size_t batch_size,
     bool const* nulls /*= nullptr*/,
-    string_type::value_type const* null_sentry /*= nullptr*/)
+    T const* null_sentry /*= nullptr*/)
 {
     bound_parameter param;
     prepare_bind(param_index, batch_size, direction, param);
@@ -2026,21 +2168,11 @@ void statement::statement_impl::bind_strings(
     {
         for (std::size_t i = 0; i < batch_size; ++i)
         {
-            const string_type s_lhs(values + i * value_size, values + (i + 1) * value_size);
-            const string_type s_rhs(null_sentry);
-#if NANODBC_USE_UNICODE
-            std::string narrow_lhs;
-            narrow_lhs.reserve(s_lhs.size());
-            convert(s_lhs, narrow_lhs);
-            std::string narrow_rhs;
-            narrow_rhs.reserve(s_rhs.size());
-            convert(s_rhs, narrow_rhs);
-            if (std::strncmp(narrow_lhs.c_str(), narrow_rhs.c_str(), value_size) != 0)
+            const std::basic_string<T> s_lhs(
+                values + i * value_size, values + (i + 1) * value_size);
+            const std::basic_string<T> s_rhs(null_sentry);
+            if (!equals(s_lhs, s_rhs))
                 bind_len_or_null_[param_index][i] = SQL_NTS;
-#else
-            if (std::strncmp(s_lhs.c_str(), s_rhs.c_str(), value_size) != 0)
-                bind_len_or_null_[param_index][i] = SQL_NTS;
-#endif
         }
     }
     else if (nulls)
@@ -2059,9 +2191,31 @@ void statement::statement_impl::bind_strings(
         }
     }
 
-    auto const buffer_length = value_size * sizeof(string_type::value_type);
-    bound_buffer<string_type::value_type> buffer(values, batch_size, buffer_length);
+    auto const buffer_length = value_size * sizeof(T);
+    bound_buffer<T> buffer(values, batch_size, buffer_length);
     bind_parameter(param, buffer);
+}
+
+template <>
+bool statement::statement_impl::equals(const std::string& lhs, const std::string& rhs)
+{
+    return std::strncmp(lhs.c_str(), rhs.c_str(), lhs.size()) == 0;
+}
+
+template <>
+bool statement::statement_impl::equals(const wide_string& lhs, const wide_string& rhs)
+{
+    // e6059ff3a79062f83256b9d1d3c9c8368798781e
+    // Functions like `swprintf()`, `wcsftime()`, `wcsncmp()` can not be used
+    // with `u16string` types. Instead, prefers to narrow unicode string to
+    // work with them, and then widen them after work has been completed.
+    std::string narrow_lhs;
+    narrow_lhs.reserve(lhs.size());
+    convert(lhs, narrow_lhs);
+    std::string narrow_rhs;
+    narrow_rhs.reserve(rhs.size());
+    convert(rhs, narrow_rhs);
+    return equals(narrow_lhs, narrow_rhs);
 }
 
 template <>
@@ -2082,6 +2236,20 @@ bool statement::statement_impl::equals(const timestamp& lhs, const timestamp& rh
     return lhs.year == rhs.year && lhs.month == rhs.month && lhs.day == rhs.day &&
            lhs.hour == rhs.hour && lhs.min == rhs.min && lhs.sec == rhs.sec &&
            lhs.fract == rhs.fract;
+}
+
+template <>
+std::vector<wide_string::value_type>&
+statement::statement_impl::get_bound_string_data(short param_index)
+{
+    return wide_string_data_[param_index];
+}
+
+template <>
+std::vector<std::string::value_type>&
+statement::statement_impl::get_bound_string_data(short param_index)
+{
+    return string_data_[param_index];
 }
 
 } // namespace nanodbc
@@ -2147,7 +2315,7 @@ public:
         auto_bind();
     }
 
-    ~result_impl() NANODBC_NOEXCEPT { cleanup_bound_columns(); }
+    ~result_impl() noexcept { cleanup_bound_columns(); }
 
     void* native_statement_handle() const { return stmt_.native_statement_handle(); }
 
@@ -2155,7 +2323,9 @@ public:
 
     long affected_rows() const { return stmt_.affected_rows(); }
 
-    long rows() const NANODBC_NOEXCEPT
+    bool has_affected_rows() const { return stmt_.affected_rows() != -1; }
+
+    long rows() const noexcept
     {
         NANODBC_ASSERT(row_count_ <= static_cast<SQLULEN>(std::numeric_limits<long>::max()));
         return static_cast<long>(row_count_);
@@ -2258,11 +2428,11 @@ public:
         if (pos == 0 || pos == static_cast<SQLULEN>(SQL_ROW_NUMBER_UNKNOWN))
             return 0;
 
-        NANODBC_ASSERT(pos <= static_cast<SQLULEN>(std::numeric_limits<unsigned long>::max()));
+        NANODBC_ASSERT(pos < static_cast<SQLULEN>(std::numeric_limits<unsigned long>::max()));
         return static_cast<unsigned long>(pos) + rowset_position_;
     }
 
-    bool at_end() const NANODBC_NOEXCEPT
+    bool at_end() const noexcept
     {
         if (at_end_)
             return true;
@@ -2281,46 +2451,56 @@ public:
 
     bool is_null(short column) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         bound_column& col = bound_columns_[column];
         if (rowset_position_ >= rows())
             throw index_range_error();
-        return col.cbdata_[rowset_position_] == SQL_NULL_DATA;
+        return col.cbdata_[static_cast<size_t>(rowset_position_)] == SQL_NULL_DATA;
     }
 
-    bool is_null(const string_type& column_name) const
+    bool is_null(const string& column_name) const
     {
         const short column = this->column(column_name);
         return is_null(column);
     }
 
-    short column(const string_type& column_name) const
+    bool is_bound(short column) const
     {
-        typedef std::map<string_type, bound_column*>::const_iterator iter;
+        throw_if_column_is_out_of_range(column);
+        bound_column& col = bound_columns_[column];
+        return col.bound_;
+    }
+
+    bool is_bound(const string& column_name) const
+    {
+        const short column = this->column(column_name);
+        return is_bound(column);
+    }
+
+    short column(const string& column_name) const
+    {
+        typedef std::map<string, bound_column*>::const_iterator iter;
         iter i = bound_columns_by_name_.find(column_name);
         if (i == bound_columns_by_name_.end())
             throw index_range_error();
         return i->second->column_;
     }
 
-    string_type column_name(short column) const
+    string column_name(short column) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         return bound_columns_[column].name_;
     }
 
     long column_size(short column) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         bound_column& col = bound_columns_[column];
         NANODBC_ASSERT(col.sqlsize_ <= static_cast<SQLULEN>(std::numeric_limits<long>::max()));
         return static_cast<long>(col.sqlsize_);
     }
 
-    int column_size(const string_type& column_name) const
+    int column_size(const string& column_name) const
     {
         const short column = this->column(column_name);
         return column_size(column);
@@ -2328,13 +2508,12 @@ public:
 
     int column_decimal_digits(short column) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         bound_column& col = bound_columns_[column];
         return col.scale_;
     }
 
-    int column_decimal_digits(const string_type& column_name) const
+    int column_decimal_digits(const string& column_name) const
     {
         const short column = this->column(column_name);
         bound_column& col = bound_columns_[column];
@@ -2343,28 +2522,56 @@ public:
 
     int column_datatype(short column) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         bound_column& col = bound_columns_[column];
         return col.sqltype_;
     }
 
-    int column_datatype(const string_type& column_name) const
+    int column_datatype(const string& column_name) const
     {
         const short column = this->column(column_name);
         bound_column& col = bound_columns_[column];
         return col.sqltype_;
     }
 
+    string column_datatype_name(short column) const
+    {
+        throw_if_column_is_out_of_range(column);
+
+        NANODBC_SQLCHAR type_name[256] = {0};
+        SQLSMALLINT len = 0; // total number of bytes
+        RETCODE rc;
+        NANODBC_CALL_RC(
+            SQLColAttribute,
+            rc,
+            stmt_.native_statement_handle(),
+            column + 1,
+            SQL_DESC_TYPE_NAME,
+            type_name,
+            sizeof(type_name) / sizeof(NANODBC_SQLCHAR),
+            &len,
+            nullptr);
+        if (!success(rc))
+            NANODBC_THROW_DATABASE_ERROR(stmt_.native_statement_handle(), SQL_HANDLE_STMT);
+
+        NANODBC_ASSERT(len % sizeof(NANODBC_SQLCHAR) == 0);
+        len = len / sizeof(NANODBC_SQLCHAR);
+        return string(type_name, type_name + len);
+    }
+
+    string column_datatype_name(const string& column_name) const
+    {
+        return column_datatype_name(this->column(column_name));
+    }
+
     int column_c_datatype(short column) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         bound_column& col = bound_columns_[column];
         return col.ctype_;
     }
 
-    int column_c_datatype(const string_type& column_name) const
+    int column_c_datatype(const string& column_name) const
     {
         const short column = this->column(column_name);
         bound_column& col = bound_columns_[column];
@@ -2388,11 +2595,50 @@ public:
         return true;
     }
 
+    void unbind()
+    {
+        const short n_columns = columns();
+        if (n_columns < 1)
+            return;
+        for (short i = 0; i < n_columns; ++i)
+            unbind(i);
+    }
+
+    void unbind(short column)
+    {
+        RETCODE rc;
+        throw_if_column_is_out_of_range(column);
+        bound_column& col = bound_columns_[column];
+
+        if (is_bound(column))
+        {
+            NANODBC_CALL_RC(
+                SQLBindCol,
+                rc,
+                stmt_.native_statement_handle(),
+                column + 1,
+                col.ctype_,
+                0,
+                0,
+                col.cbdata_); // Re-use existing cbdata_ buffer
+            if (!success(rc))
+                NANODBC_THROW_DATABASE_ERROR(stmt_.native_statement_handle(), SQL_HANDLE_STMT);
+            delete[] col.pdata_;
+            col.pdata_ = 0;
+            col.bound_ = false;
+        }
+    }
+
+    void unbind(const string& column_name)
+    {
+        const short column = this->column(column_name);
+        unbind(column);
+    }
+
     template <class T>
     void get_ref(short column, T& result) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         if (is_null(column))
             throw null_access_error();
         get_ref_impl<T>(column, result);
@@ -2401,8 +2647,7 @@ public:
     template <class T>
     void get_ref(short column, const T& fallback, T& result) const
     {
-        if (column >= bound_columns_size_)
-            throw index_range_error();
+        throw_if_column_is_out_of_range(column);
         if (is_null(column))
         {
             result = fallback;
@@ -2412,7 +2657,7 @@ public:
     }
 
     template <class T>
-    void get_ref(const string_type& column_name, T& result) const
+    void get_ref(const string& column_name, T& result) const
     {
         const short column = this->column(column_name);
         if (is_null(column))
@@ -2421,7 +2666,7 @@ public:
     }
 
     template <class T>
-    void get_ref(const string_type& column_name, const T& fallback, T& result) const
+    void get_ref(const string& column_name, const T& fallback, T& result) const
     {
         const short column = this->column(column_name);
         if (is_null(column))
@@ -2449,7 +2694,7 @@ public:
     }
 
     template <class T>
-    T get(const string_type& column_name) const
+    T get(const string& column_name) const
     {
         T result;
         get_ref(column_name, result);
@@ -2457,7 +2702,7 @@ public:
     }
 
     template <class T>
-    T get(const string_type& column_name, const T& fallback) const
+    T get(const string& column_name, const T& fallback) const
     {
         T result;
         get_ref(column_name, fallback, result);
@@ -2465,22 +2710,40 @@ public:
     }
 
 private:
-    template <class T>
+    template <typename T>
+    T* ensure_pdata(short column) const;
+
+    template <class T, typename std::enable_if<!is_string<T>::value, int>::type = 0>
     void get_ref_impl(short column, T& result) const;
 
-    void before_move() NANODBC_NOEXCEPT
+    template <class T, typename std::enable_if<is_string<T>::value, int>::type = 0>
+    void get_ref_impl(short column, T& result) const;
+
+    template <class T, typename std::enable_if<!is_character<T>::value, int>::type = 0>
+    void get_ref_from_string_column(short column, T& result) const;
+
+    template <class T, typename std::enable_if<is_character<T>::value, int>::type = 0>
+    void get_ref_from_string_column(short column, T& result) const;
+
+    void throw_if_column_is_out_of_range(short column) const
+    {
+        if ((column < 0) || (column >= bound_columns_size_))
+            throw index_range_error();
+    }
+
+    void before_move() noexcept
     {
         for (short i = 0; i < bound_columns_size_; ++i)
         {
             bound_column& col = bound_columns_[i];
-            for (long j = 0; j < rowset_size_; ++j)
+            for (std::size_t j = 0; j < static_cast<size_t>(rowset_size_); ++j)
                 col.cbdata_[j] = 0;
             if (col.blob_ && col.pdata_)
                 release_bound_resources(i);
         }
     }
 
-    void release_bound_resources(short column) NANODBC_NOEXCEPT
+    void release_bound_resources(short column) noexcept
     {
         NANODBC_ASSERT(column < bound_columns_size_);
         bound_column& col = bound_columns_[column];
@@ -2489,7 +2752,7 @@ private:
         col.clen_ = 0;
     }
 
-    void cleanup_bound_columns() NANODBC_NOEXCEPT
+    void cleanup_bound_columns() noexcept
     {
         before_move();
         delete[] bound_columns_;
@@ -2541,8 +2804,8 @@ private:
 
         RETCODE rc;
         NANODBC_SQLCHAR column_name[1024];
-        SQLSMALLINT sqltype, scale, nullable, len;
-        SQLULEN sqlsize;
+        SQLSMALLINT sqltype = 0, scale = 0, nullable = 0, len = 0;
+        SQLULEN sqlsize = 0;
 
 #if defined(NANODBC_DO_ASYNC_IMPL)
         stmt_.disable_async();
@@ -2575,6 +2838,7 @@ private:
                 {
                 case SQL_VARCHAR:
                 case SQL_WVARCHAR:
+                case SQL_SS_XML:
                 {
                     // Divide in half, due to sqlsize being 32-bit in Win32 (and 64-bit in x64)
                     // sqlsize = std::numeric_limits<int32_t>::max() / 2 - 1;
@@ -2584,7 +2848,7 @@ private:
             }
 
             bound_column& col = bound_columns_[i];
-            col.name_ = reinterpret_cast<string_type::value_type*>(column_name);
+            col.name_ = reinterpret_cast<string::value_type*>(column_name);
             col.column_ = i;
             col.sqltype_ = sqltype;
             col.sqlsize_ = sqlsize;
@@ -2604,11 +2868,18 @@ private:
                 break;
             case SQL_DOUBLE:
             case SQL_FLOAT:
-            case SQL_DECIMAL:
             case SQL_REAL:
-            case SQL_NUMERIC:
                 col.ctype_ = SQL_C_DOUBLE;
                 col.clen_ = sizeof(double);
+                break;
+            case SQL_DECIMAL:
+            case SQL_NUMERIC:
+                col.ctype_ = SQL_C_CHAR;
+                // SQL column size defines number of digits without the decimal mark
+                // and without minus sign which may also occur.
+                // We need to adjust buffer length allow space for null-termination character
+                // as well as the fractional part separator and the minus sign.
+                col.clen_ = (col.sqlsize_ + 1 + 1 + 1) * sizeof(SQLCHAR);
                 break;
             case SQL_DATE:
             case SQL_TYPE_DATE:
@@ -2629,8 +2900,7 @@ private:
                 break;
             case SQL_CHAR:
             case SQL_VARCHAR:
-            case SQL_NVARCHAR:
-                col.ctype_ = SQL_C_CHAR;
+                col.ctype_ = sql_ctype<std::string>::value;
                 col.clen_ = (col.sqlsize_ + 1) * sizeof(SQLCHAR);
                 if (is_blob)
                 {
@@ -2640,7 +2910,8 @@ private:
                 break;
             case SQL_WCHAR:
             case SQL_WVARCHAR:
-                col.ctype_ = SQL_C_WCHAR;
+            case SQL_SS_XML:
+                col.ctype_ = sql_ctype<wide_string>::value;
                 col.clen_ = (col.sqlsize_ + 1) * sizeof(SQLWCHAR);
                 if (is_blob)
                 {
@@ -2649,7 +2920,12 @@ private:
                 }
                 break;
             case SQL_LONGVARCHAR:
-                col.ctype_ = SQL_C_CHAR;
+                col.ctype_ = sql_ctype<std::string>::value;
+                col.blob_ = true;
+                col.clen_ = 0;
+                break;
+            case SQL_WLONGVARCHAR:
+                col.ctype_ = sql_ctype<wide_string>::value;
                 col.blob_ = true;
                 col.clen_ = 0;
                 break;
@@ -2662,7 +2938,7 @@ private:
                 col.clen_ = 0;
                 break;
             default:
-                col.ctype_ = sql_ctype<string_type>::value;
+                col.ctype_ = sql_ctype<string>::value;
                 col.clen_ = 128;
                 break;
             }
@@ -2671,7 +2947,7 @@ private:
         for (SQLSMALLINT i = 0; i < n_columns; ++i)
         {
             bound_column& col = bound_columns_[i];
-            col.cbdata_ = new null_type[rowset_size_];
+            col.cbdata_ = new null_type[static_cast<size_t>(rowset_size_)];
             if (col.blob_)
             {
                 NANODBC_CALL_RC(
@@ -2700,6 +2976,7 @@ private:
                     col.cbdata_); // StrLen_or_Ind
                 if (!success(rc))
                     NANODBC_THROW_DATABASE_ERROR(stmt_.native_statement_handle(), SQL_HANDLE_STMT);
+                col.bound_ = true;
             }
         }
     }
@@ -2711,7 +2988,7 @@ private:
     bound_column* bound_columns_;
     short bound_columns_size_;
     long rowset_position_;
-    std::map<string_type, bound_column*> bound_columns_by_name_;
+    std::map<string, bound_column*> bound_columns_by_name_;
     bool at_end_;
 #if defined(NANODBC_DO_ASYNC_IMPL)
     bool async_; // true if statement is currently in SQL_STILL_EXECUTING mode
@@ -2725,11 +3002,11 @@ inline void result::result_impl::get_ref_impl<date>(short column, date& result) 
     switch (col.ctype_)
     {
     case SQL_C_DATE:
-        result = *reinterpret_cast<date*>(col.pdata_ + rowset_position_ * col.clen_);
+        result = *ensure_pdata<date>(column);
         return;
     case SQL_C_TIMESTAMP:
     {
-        timestamp stamp = *reinterpret_cast<timestamp*>(col.pdata_ + rowset_position_ * col.clen_);
+        timestamp stamp = *ensure_pdata<timestamp>(column);
         date d = {stamp.year, stamp.month, stamp.day};
         result = d;
         return;
@@ -2745,11 +3022,11 @@ inline void result::result_impl::get_ref_impl<time>(short column, time& result) 
     switch (col.ctype_)
     {
     case SQL_C_TIME:
-        result = *reinterpret_cast<time*>(col.pdata_ + rowset_position_ * col.clen_);
+        result = *ensure_pdata<time>(column);
         return;
     case SQL_C_TIMESTAMP:
     {
-        timestamp stamp = *reinterpret_cast<timestamp*>(col.pdata_ + rowset_position_ * col.clen_);
+        timestamp stamp = *ensure_pdata<timestamp>(column);
         time t = {stamp.hour, stamp.min, stamp.sec};
         result = t;
         return;
@@ -2766,20 +3043,20 @@ inline void result::result_impl::get_ref_impl<timestamp>(short column, timestamp
     {
     case SQL_C_DATE:
     {
-        date d = *reinterpret_cast<date*>(col.pdata_ + rowset_position_ * col.clen_);
+        date d = *ensure_pdata<date>(column);
         timestamp stamp = {d.year, d.month, d.day, 0, 0, 0, 0};
         result = stamp;
         return;
     }
     case SQL_C_TIMESTAMP:
-        result = *reinterpret_cast<timestamp*>(col.pdata_ + rowset_position_ * col.clen_);
+        result = *ensure_pdata<timestamp>(column);
         return;
     }
     throw type_incompatible_error();
 }
 
-template <>
-inline void result::result_impl::get_ref_impl<string_type>(short column, string_type& result) const
+template <class T, typename std::enable_if<is_string<T>::value, int>::type>
+inline void result::result_impl::get_ref_impl(short column, T& result) const
 {
     bound_column& col = bound_columns_[column];
     const SQLULEN column_size = col.sqlsize_;
@@ -2789,9 +3066,9 @@ inline void result::result_impl::get_ref_impl<string_type>(short column, string_
     case SQL_C_CHAR:
     case SQL_C_BINARY:
     {
-        if (col.blob_)
+        if (!is_bound(column))
         {
-            // Input is always std::string, while output may be std::string or wide_string_type
+            // Input is always std::string, while output may be std::string or wide_string
             std::string out;
             // The length of the data available to return, decreasing with subsequent SQLGetData
             // calls.
@@ -2817,38 +3094,39 @@ inline void result::result_impl::get_ref_impl<string_type>(short column, string_
                     buffer,          // TargetValuePtr
                     buffer_size,     // BufferLength
                     &ValueLenOrInd); // StrLen_or_IndPtr
-                if (ValueLenOrInd > 0)
+                if (ValueLenOrInd == SQL_NO_TOTAL)
+                    out.append(buffer, col.ctype_ == SQL_C_BINARY ? buffer_size : buffer_size - 1);
+                else if (ValueLenOrInd > 0)
                     out.append(
                         buffer,
                         std::min<std::size_t>(
                             ValueLenOrInd,
                             col.ctype_ == SQL_C_BINARY ? buffer_size : buffer_size - 1));
                 else if (ValueLenOrInd == SQL_NULL_DATA)
-                    col.cbdata_[rowset_position_] = (SQLINTEGER)SQL_NULL_DATA;
+                    col.cbdata_[static_cast<size_t>(rowset_position_)] = (SQLINTEGER)SQL_NULL_DATA;
                 // Sequence of successful calls is:
                 // SQL_NO_DATA or SQL_SUCCESS_WITH_INFO followed by SQL_SUCCESS.
             } while (rc == SQL_SUCCESS_WITH_INFO);
             if (rc == SQL_SUCCESS || rc == SQL_NO_DATA)
-                convert(out, result);
+                convert(std::move(out), result);
             else if (!success(rc))
                 NANODBC_THROW_DATABASE_ERROR(stmt_.native_statement_handle(), SQL_HANDLE_STMT);
         }
         else
-        {
+        { // bound and not blob
             const char* s = col.pdata_ + rowset_position_ * col.clen_;
-            const std::string::size_type str_size = std::strlen(s);
-            result.assign(s, s + str_size);
+            convert(s, result);
         }
         return;
     }
 
     case SQL_C_WCHAR:
     {
-        if (col.blob_)
+        if (!is_bound(column))
         {
-            // Input is always wide_string_type, output might be std::string or wide_string_type.
+            // Input is always wide_string, output might be std::string or wide_string.
             // Use a string builder to build the output string.
-            wide_string_type out;
+            wide_string out;
             // The length of the data available to return, decreasing with subsequent SQLGetData
             // calls.
             // But, NOT the length of data returned into the buffer (apart from the final call).
@@ -2873,114 +3151,81 @@ inline void result::result_impl::get_ref_impl<string_type>(short column, string_
                     buffer,          // TargetValuePtr
                     buffer_size,     // BufferLength
                     &ValueLenOrInd); // StrLen_or_IndPtr
-                if (ValueLenOrInd > 0)
+                if (ValueLenOrInd == SQL_NO_TOTAL)
+                    out.append(buffer, (buffer_size / sizeof(wide_char_t)) - 1);
+                else if (ValueLenOrInd > 0)
                     out.append(
                         buffer,
                         std::min<std::size_t>(
                             ValueLenOrInd / sizeof(wide_char_t),
                             (buffer_size / sizeof(wide_char_t)) - 1));
                 else if (ValueLenOrInd == SQL_NULL_DATA)
-                    col.cbdata_[rowset_position_] = (SQLINTEGER)SQL_NULL_DATA;
+                    col.cbdata_[static_cast<std::size_t>(rowset_position_)] =
+                        (SQLINTEGER)SQL_NULL_DATA;
                 // Sequence of successful calls is:
                 // SQL_NO_DATA or SQL_SUCCESS_WITH_INFO followed by SQL_SUCCESS.
             } while (rc == SQL_SUCCESS_WITH_INFO);
             if (rc == SQL_SUCCESS || rc == SQL_NO_DATA)
-                convert(out, result);
+                convert(std::move(out), result);
             else if (!success(rc))
                 NANODBC_THROW_DATABASE_ERROR(stmt_.native_statement_handle(), SQL_HANDLE_STMT);
             ;
         }
         else
-        {
-            // Type is unicode in the database, convert if necessary
-            const SQLWCHAR* s =
+        { // bound and not blob
+            SQLWCHAR const* s =
                 reinterpret_cast<SQLWCHAR*>(col.pdata_ + rowset_position_ * col.clen_);
-            const string_type::size_type str_size =
-                col.cbdata_[rowset_position_] / sizeof(SQLWCHAR);
-            wide_string_type temp(s, s + str_size);
-            convert(temp, result);
+            string::size_type const str_size =
+                col.cbdata_[static_cast<size_t>(rowset_position_)] / sizeof(SQLWCHAR);
+            auto const us = reinterpret_cast<wide_char_t const*>(
+                s); // no-op or unsigned short to signed char16_t
+            convert(us, str_size, result);
         }
-        return;
-    }
-
-    case SQL_C_GUID:
-    {
-        const char* s = col.pdata_ + rowset_position_ * col.clen_;
-        result.assign(s, s + column_size);
         return;
     }
 
     case SQL_C_LONG:
     {
-        std::string buffer;
-        buffer.reserve(column_size + 1); // ensure terminating null
-        buffer.resize(buffer.capacity());
-        using std::fill;
-        fill(buffer.begin(), buffer.end(), '\0');
-        const int32_t data = *reinterpret_cast<int32_t*>(col.pdata_ + rowset_position_ * col.clen_);
+        std::string buffer(column_size + 1, 0); // ensure terminating null
+        const int32_t data = *ensure_pdata<int32_t>(column);
         const int bytes =
             std::snprintf(const_cast<char*>(buffer.data()), column_size + 1, "%d", data);
         if (bytes == -1)
             throw type_incompatible_error();
-        else if ((SQLULEN)bytes < column_size)
-            buffer.resize(bytes);
-        buffer.resize(std::strlen(buffer.data())); // drop any trailing nulls
-        result.reserve(buffer.size() * sizeof(string_type::value_type));
-        convert(buffer, result);
+        convert(buffer.data(), result); // passing the C pointer drops trailing nulls
         return;
     }
 
     case SQL_C_SBIGINT:
     {
-        using namespace std; // in case intmax_t is in namespace std
-        std::string buffer;
-        buffer.reserve(column_size + 1); // ensure terminating null
-        buffer.resize(buffer.capacity());
-        using std::fill;
-        fill(buffer.begin(), buffer.end(), '\0');
-        const intmax_t data =
-            (intmax_t) * reinterpret_cast<int64_t*>(col.pdata_ + rowset_position_ * col.clen_);
+        using namespace std;                    // in case intmax_t is in namespace std
+        std::string buffer(column_size + 1, 0); // ensure terminating null
+        const intmax_t data = (intmax_t)*ensure_pdata<int64_t>(column);
         const int bytes =
             std::snprintf(const_cast<char*>(buffer.data()), column_size + 1, "%jd", data);
         if (bytes == -1)
             throw type_incompatible_error();
-        else if ((SQLULEN)bytes < column_size)
-            buffer.resize(bytes);
-        buffer.resize(std::strlen(buffer.data())); // drop any trailing nulls
-        result.reserve(buffer.size() * sizeof(string_type::value_type));
-        convert(buffer, result);
+        convert(buffer.data(), result); // passing the C pointer drops trailing nulls
         return;
     }
 
     case SQL_C_FLOAT:
     {
-        std::string buffer;
-        buffer.reserve(column_size + 1); // ensure terminating null
-        buffer.resize(buffer.capacity());
-        using std::fill;
-        fill(buffer.begin(), buffer.end(), '\0');
-        const float data = *reinterpret_cast<float*>(col.pdata_ + rowset_position_ * col.clen_);
+        std::string buffer(column_size + 1, 0); // ensure terminating null
+        const float data = *ensure_pdata<float>(column);
         const int bytes =
             std::snprintf(const_cast<char*>(buffer.data()), column_size + 1, "%f", data);
         if (bytes == -1)
             throw type_incompatible_error();
-        else if ((SQLULEN)bytes < column_size)
-            buffer.resize(bytes);
-        buffer.resize(std::strlen(buffer.data())); // drop any trailing nulls
-        result.reserve(buffer.size() * sizeof(string_type::value_type));
-        convert(buffer, result);
+        convert(buffer.data(), result); // passing the C pointer drops trailing nulls
         return;
     }
 
     case SQL_C_DOUBLE:
     {
-        std::string buffer;
         const SQLULEN width = column_size + 2; // account for decimal mark and sign
-        buffer.reserve(width + 1);             // ensure terminating null
-        buffer.resize(buffer.capacity());
-        using std::fill;
-        fill(buffer.begin(), buffer.end(), '\0');
-        const double data = *reinterpret_cast<double*>(col.pdata_ + rowset_position_ * col.clen_);
+        std::string buffer(width + 1, 0);      // ensure terminating null
+        const double data = *ensure_pdata<double>(column);
         const int bytes = std::snprintf(
             const_cast<char*>(buffer.data()),
             width + 1,
@@ -2989,17 +3234,13 @@ inline void result::result_impl::get_ref_impl<string_type>(short column, string_
             data);
         if (bytes == -1)
             throw type_incompatible_error();
-        else if ((SQLULEN)bytes < column_size)
-            buffer.resize(bytes);
-        buffer.resize(std::strlen(buffer.data())); // drop any trailing nulls
-        result.reserve(buffer.size() * sizeof(string_type::value_type));
-        convert(buffer, result);
+        convert(buffer.data(), result); // passing the C pointer drops trailing nulls
         return;
     }
 
     case SQL_C_DATE:
     {
-        const date d = *reinterpret_cast<date*>(col.pdata_ + rowset_position_ * col.clen_);
+        const date d = *ensure_pdata<date>(column);
         std::tm st = {0};
         st.tm_year = d.year - 1900;
         st.tm_mon = d.month - 1;
@@ -3015,7 +3256,7 @@ inline void result::result_impl::get_ref_impl<string_type>(short column, string_
 
     case SQL_C_TIME:
     {
-        const time t = *reinterpret_cast<time*>(col.pdata_ + rowset_position_ * col.clen_);
+        const time t = *ensure_pdata<time>(column);
         std::tm st = {0};
         st.tm_hour = t.hour;
         st.tm_min = t.min;
@@ -3031,8 +3272,7 @@ inline void result::result_impl::get_ref_impl<string_type>(short column, string_
 
     case SQL_C_TIMESTAMP:
     {
-        const timestamp stamp =
-            *reinterpret_cast<timestamp*>(col.pdata_ + rowset_position_ * col.clen_);
+        const timestamp stamp = *ensure_pdata<timestamp>(column);
         std::tm st = {0};
         st.tm_year = stamp.year - 1900;
         st.tm_mon = stamp.month - 1;
@@ -3064,7 +3304,7 @@ inline void result::result_impl::get_ref_impl<std::vector<std::uint8_t>>(
     {
     case SQL_C_BINARY:
     {
-        if (col.blob_)
+        if (!is_bound(column))
         {
             // Input and output is always array of bytes.
             std::vector<std::uint8_t> out;
@@ -3100,7 +3340,7 @@ inline void result::result_impl::get_ref_impl<std::vector<std::uint8_t>>(
                     out.insert(std::end(out), buffer, buffer + buffer_size_filled);
                 }
                 else if (ValueLenOrInd == SQL_NULL_DATA)
-                    col.cbdata_[rowset_position_] = (SQLINTEGER)SQL_NULL_DATA;
+                    col.cbdata_[static_cast<size_t>(rowset_position_)] = (SQLINTEGER)SQL_NULL_DATA;
                 // Sequence of successful calls is:
                 // SQL_NO_DATA or SQL_SUCCESS_WITH_INFO followed by SQL_SUCCESS.
             } while (rc == SQL_SUCCESS_WITH_INFO);
@@ -3121,43 +3361,143 @@ inline void result::result_impl::get_ref_impl<std::vector<std::uint8_t>>(
     throw type_incompatible_error();
 }
 
-template <class T>
+namespace detail
+{
+auto from_string(std::string const& s, float)
+{
+    return std::stof(s);
+}
+
+auto from_string(std::string const& s, double)
+{
+    return std::stod(s);
+}
+
+auto from_string(std::string const& s, long long)
+{
+    return std::stoll(s);
+}
+
+auto from_string(std::string const& s, unsigned long long)
+{
+    return std::stoull(s);
+}
+
+template <typename R, typename std::enable_if<std::is_integral<R>::value, int>::type = 0>
+auto from_string(std::string const& s, R)
+{
+    auto integer = from_string(
+        s,
+        typename std::conditional<std::is_signed<R>::value, long long, unsigned long long>::type{});
+    if (integer > std::numeric_limits<R>::max() || integer < std::numeric_limits<R>::min())
+        throw std::range_error("from_string argument out of range");
+    return static_cast<R>(integer);
+}
+} // namespace detail
+
+template <typename R>
+auto from_string(std::string const& s) -> R
+{
+    return detail::from_string(s, R{});
+}
+
+template <class T, typename std::enable_if<is_character<T>::value, int>::type>
+void result::result_impl::get_ref_from_string_column(short column, T& result) const
+{
+    bound_column& col = bound_columns_[column];
+    switch (col.ctype_)
+    {
+    case SQL_C_CHAR:
+        result = static_cast<T>(*ensure_pdata<char>(column));
+        return;
+    case SQL_C_WCHAR:
+        result = static_cast<T>(*ensure_pdata<wide_char_t>(column));
+        return;
+    }
+    throw type_incompatible_error();
+}
+
+template <class T, typename std::enable_if<!is_character<T>::value, int>::type>
+void result::result_impl::get_ref_from_string_column(short column, T& result) const
+{
+    bound_column& col = bound_columns_[column];
+    if (col.ctype_ != SQL_C_CHAR && col.ctype_ != SQL_C_WCHAR)
+        throw type_incompatible_error();
+    std::string str;
+    get_ref_impl(col.column_, str);
+    result = from_string<T>(str);
+}
+
+template <typename T>
+T* result::result_impl::ensure_pdata(short column) const
+{
+    bound_column& col = bound_columns_[column];
+    SQLLEN ValueLenOrInd;
+    SQLRETURN rc;
+    if (is_bound(column))
+    {
+        return (T*)(col.pdata_ + rowset_position_ * col.clen_);
+    }
+
+    T* buffer = new T;
+    const std::size_t buffer_size = sizeof(T);
+    void* handle = native_statement_handle();
+    NANODBC_CALL_RC(
+        SQLGetData,
+        rc,
+        handle,              // StatementHandle
+        column + 1,          // Col_or_Param_Num
+        sql_ctype<T>::value, // TargetType
+        buffer,              // TargetValuePtr
+        buffer_size,         // BufferLength
+        &ValueLenOrInd);     // StrLen_or_IndPtr
+
+    if (ValueLenOrInd == SQL_NULL_DATA)
+        col.cbdata_[static_cast<size_t>(rowset_position_)] = (SQLINTEGER)SQL_NULL_DATA;
+    if (!success(rc))
+        NANODBC_THROW_DATABASE_ERROR(stmt_.native_statement_handle(), SQL_HANDLE_STMT);
+    NANODBC_ASSERT(ValueLenOrInd == (SQLLEN)buffer_size);
+
+    return buffer;
+}
+
+template <class T, typename std::enable_if<!is_string<T>::value, int>::type>
 void result::result_impl::get_ref_impl(short column, T& result) const
 {
     bound_column& col = bound_columns_[column];
     using namespace std; // if int64_t is in std namespace (in c++11)
-    const char* s = col.pdata_ + rowset_position_ * col.clen_;
     switch (col.ctype_)
     {
     case SQL_C_CHAR:
-        result = (T) * (char*)(s);
+    case SQL_C_WCHAR:
+        get_ref_from_string_column(column, result);
         return;
     case SQL_C_SSHORT:
-        result = (T) * (short*)(s);
+        result = (T) * (ensure_pdata<short>(column));
         return;
     case SQL_C_USHORT:
-        result = (T) * (unsigned short*)(s);
+        result = (T) * (ensure_pdata<unsigned short>(column));
         return;
     case SQL_C_LONG:
-        result = (T) * (int32_t*)(s);
+        result = (T) * (ensure_pdata<int32_t>(column));
         return;
     case SQL_C_SLONG:
-        result = (T) * (int32_t*)(s);
+        result = (T) * (ensure_pdata<int32_t>(column));
         return;
     case SQL_C_ULONG:
-        result = (T) * (uint32_t*)(s);
+        result = (T) * (ensure_pdata<uint32_t>(column));
         return;
     case SQL_C_FLOAT:
-        result = (T) * (float*)(s);
+        result = (T) * (ensure_pdata<float>(column));
         return;
     case SQL_C_DOUBLE:
-        result = (T) * (double*)(s);
+        result = (T) * (ensure_pdata<double>(column));
         return;
     case SQL_C_SBIGINT:
-        result = (T) * (int64_t*)(s);
+        result = (T) * (ensure_pdata<int64_t>(column));
         return;
     case SQL_C_UBIGINT:
-        result = (T) * (uint64_t*)(s);
+        result = (T) * (ensure_pdata<uint64_t>(column));
         return;
     }
     throw type_incompatible_error();
@@ -3180,6 +3520,59 @@ void result::result_impl::get_ref_impl(short column, T& result) const
 namespace nanodbc
 {
 
+std::list<datasource> list_datasources()
+{
+    NANODBC_SQLCHAR name[1024] = {0};
+    NANODBC_SQLCHAR driver[1024] = {0};
+    SQLSMALLINT name_len_ret{0};
+    SQLSMALLINT driver_len_ret{0};
+    SQLUSMALLINT direction{SQL_FETCH_FIRST};
+
+    connection env; // ensures handles RAII
+    env.allocate();
+    NANODBC_ASSERT(env.native_env_handle());
+
+    std::list<datasource> dsns;
+    RETCODE rc{SQL_SUCCESS};
+    do
+    {
+        NANODBC_CALL_RC(
+            NANODBC_FUNC(SQLDataSources),
+            rc,
+            env.native_env_handle(),                  // EnvironmentHandle
+            direction,                                // Direction
+            name,                                     // DSN Name
+            sizeof(name) / sizeof(NANODBC_SQLCHAR),   // Size of Name Buffer
+            &name_len_ret,                            // Written DSN Name length
+            driver,                                   // Driver Name
+            sizeof(driver) / sizeof(NANODBC_SQLCHAR), // Size of Driver Buffer
+            &driver_len_ret);                         // Written Driver length
+
+        if (rc == SQL_SUCCESS)
+        {
+            using char_type = string::value_type;
+            static_assert(
+                sizeof(NANODBC_SQLCHAR) == sizeof(char_type),
+                "incompatible SQLCHAR and string::value_type");
+
+            datasource dsn;
+            dsn.name = string(&name[0], &name[std::char_traits<NANODBC_SQLCHAR>::length(name)]);
+            dsn.driver =
+                string(&driver[0], &driver[std::char_traits<NANODBC_SQLCHAR>::length(driver)]);
+
+            dsns.push_back(std::move(dsn));
+            direction = SQL_FETCH_NEXT;
+        }
+        else
+        {
+            if (rc != SQL_NO_DATA)
+                NANODBC_THROW_DATABASE_ERROR(env.native_env_handle(), SQL_HANDLE_ENV);
+        }
+    } while (success(rc));
+
+    return dsns;
+}
+
 std::list<driver> list_drivers()
 {
     NANODBC_SQLCHAR descr[1024] = {0};
@@ -3188,18 +3581,18 @@ std::list<driver> list_drivers()
     SQLSMALLINT attrs_len_ret{0};
     SQLUSMALLINT direction{SQL_FETCH_FIRST};
 
-    HENV env{0};
-    allocate_environment_handle(env);
+    connection env; // ensures handles RAII
+    env.allocate();
+    NANODBC_ASSERT(env.native_env_handle());
 
     std::list<driver> drivers;
     RETCODE rc{SQL_SUCCESS};
     do
     {
-        NANODBC_ASSERT(env);
         NANODBC_CALL_RC(
             NANODBC_FUNC(SQLDrivers),
             rc,
-            env,
+            env.native_env_handle(),
             direction,                               // EnvironmentHandle
             descr,                                   // DriverDescription
             sizeof(descr) / sizeof(NANODBC_SQLCHAR), // BufferLength1
@@ -3210,13 +3603,13 @@ std::list<driver> list_drivers()
 
         if (rc == SQL_SUCCESS)
         {
-            using char_type = string_type::value_type;
+            using char_type = string::value_type;
             static_assert(
                 sizeof(NANODBC_SQLCHAR) == sizeof(char_type),
-                "incompatible SQLCHAR and string_type::value_type");
+                "incompatible SQLCHAR and string::value_type");
 
             driver drv;
-            drv.name = string_type(&descr[0], &descr[strarrlen(descr)]);
+            drv.name = string(&descr[0], &descr[std::char_traits<NANODBC_SQLCHAR>::length(descr)]);
 
             // Split "Key1=Value1\0Key2=Value2\0\0" into list of key-value pairs
             auto beg = &attrs[0];
@@ -3240,73 +3633,20 @@ std::list<driver> list_drivers()
         else
         {
             if (rc != SQL_NO_DATA)
-                NANODBC_THROW_DATABASE_ERROR(env, SQL_HANDLE_ENV);
+                NANODBC_THROW_DATABASE_ERROR(env.native_env_handle(), SQL_HANDLE_ENV);
         }
     } while (success(rc));
 
     return drivers;
 }
 
-std::list<data_source> list_data_sources()
-{
-    NANODBC_SQLCHAR name[1024] = {0};
-    NANODBC_SQLCHAR descr[1024] = {0};
-    SQLSMALLINT name_len_ret{0};
-    SQLSMALLINT descr_len_ret{0};
-    SQLUSMALLINT direction{SQL_FETCH_FIRST};
-
-    HENV env{0};
-    allocate_environment_handle(env);
-
-    std::list<data_source> data_sources;
-    RETCODE rc{SQL_SUCCESS};
-    do
-    {
-        NANODBC_ASSERT(env);
-        NANODBC_CALL_RC(
-            NANODBC_FUNC(SQLDataSources),
-            rc,
-            env,                                     // EnvironmentHandle
-            direction,                               // Direction
-            name,                                    // ServerName
-            sizeof(name) / sizeof(NANODBC_SQLCHAR),  // BufferLength1
-            &name_len_ret,                           // NameLength1Ptr
-            descr,                                   // Description
-            sizeof(descr) / sizeof(NANODBC_SQLCHAR), // BufferLength2
-            &descr_len_ret);                         // NameLength2Ptr
-
-        if (rc == SQL_SUCCESS)
-        {
-            using char_type = string_type::value_type;
-            static_assert(
-                sizeof(NANODBC_SQLCHAR) == sizeof(char_type),
-                "incompatible SQLCHAR and string_type::value_type");
-
-            data_source src;
-            src.name = string_type(&name[0], &name[strarrlen(name)]);
-            src.description = string_type(&descr[0], &descr[strarrlen(descr)]);
-
-            data_sources.push_back(std::move(src));
-
-            direction = SQL_FETCH_NEXT;
-        }
-        else
-        {
-            if (rc != SQL_NO_DATA)
-                NANODBC_THROW_DATABASE_ERROR(env, SQL_HANDLE_ENV);
-        }
-    } while (success(rc));
-
-    return data_sources;
-}
-
-result execute(connection& conn, const string_type& query, long batch_operations, long timeout)
+result execute(connection& conn, const string& query, long batch_operations, long timeout)
 {
     class statement statement;
     return statement.execute_direct(conn, query, batch_operations, timeout);
 }
 
-void just_execute(connection& conn, const string_type& query, long batch_operations, long timeout)
+void just_execute(connection& conn, const string& query, long batch_operations, long timeout)
 {
     class statement statement;
     statement.just_execute_direct(conn, query, batch_operations, timeout);
@@ -3337,7 +3677,7 @@ void just_transact(statement& stmt, long batch_operations)
     transaction.commit();
 }
 
-void prepare(statement& stmt, const string_type& query, long timeout)
+void prepare(statement& stmt, const string& query, long timeout)
 {
     stmt.prepare(stmt.connection(), query, timeout);
 }
@@ -3369,11 +3709,10 @@ connection::connection(const connection& rhs)
 {
 }
 
-#ifndef NANODBC_NO_MOVE_CTOR
-connection::connection(connection&& rhs) NANODBC_NOEXCEPT : impl_(std::move(rhs.impl_))
+connection::connection(connection&& rhs) noexcept
+    : impl_(std::move(rhs.impl_))
 {
 }
-#endif
 
 connection& connection::operator=(connection rhs)
 {
@@ -3381,59 +3720,56 @@ connection& connection::operator=(connection rhs)
     return *this;
 }
 
-void connection::swap(connection& rhs) NANODBC_NOEXCEPT
+void connection::swap(connection& rhs) noexcept
 {
     using std::swap;
     swap(impl_, rhs.impl_);
 }
 
-connection::connection(
-    const string_type& dsn,
-    const string_type& user,
-    const string_type& pass,
-    long timeout)
+connection::connection(const string& dsn, const string& user, const string& pass, long timeout)
     : impl_(new connection_impl(dsn, user, pass, timeout))
 {
 }
 
-connection::connection(const string_type& connection_string, long timeout)
+connection::connection(const string& connection_string, long timeout)
     : impl_(new connection_impl(connection_string, timeout))
 {
 }
 
-connection::~connection() NANODBC_NOEXCEPT
+connection::~connection() noexcept {}
+
+void connection::allocate()
 {
+    impl_->allocate();
 }
 
-void connection::connect(
-    const string_type& dsn,
-    const string_type& user,
-    const string_type& pass,
-    long timeout)
+void connection::deallocate()
+{
+    impl_->deallocate();
+}
+
+void connection::connect(const string& dsn, const string& user, const string& pass, long timeout)
 {
     impl_->connect(dsn, user, pass, timeout);
 }
 
-void connection::connect(const string_type& connection_string, long timeout)
+void connection::connect(const string& connection_string, long timeout)
 {
     impl_->connect(connection_string, timeout);
 }
 
 #if !defined(NANODBC_DISABLE_ASYNC) && defined(SQL_ATTR_ASYNC_DBC_EVENT)
 bool connection::async_connect(
-    const string_type& dsn,
-    const string_type& user,
-    const string_type& pass,
+    const string& dsn,
+    const string& user,
+    const string& pass,
     void* event_handle,
     long timeout)
 {
     return impl_->connect(dsn, user, pass, timeout, event_handle) == SQL_STILL_EXECUTING;
 }
 
-bool connection::async_connect(
-    const string_type& connection_string,
-    void* event_handle,
-    long timeout)
+bool connection::async_connect(const string& connection_string, void* event_handle, long timeout)
 {
     return impl_->connect(connection_string, timeout, event_handle) == SQL_STILL_EXECUTING;
 }
@@ -3475,27 +3811,27 @@ void* connection::native_env_handle() const
     return impl_->native_env_handle();
 }
 
-string_type connection::dbms_name() const
+string connection::dbms_name() const
 {
     return impl_->dbms_name();
 }
 
-string_type connection::dbms_version() const
+string connection::dbms_version() const
 {
     return impl_->dbms_version();
 }
 
-string_type connection::driver_name() const
+string connection::driver_name() const
 {
     return impl_->driver_name();
 }
 
-string_type connection::database_name() const
+string connection::database_name() const
 {
     return impl_->database_name();
 }
 
-string_type connection::catalog_name() const
+string connection::catalog_name() const
 {
     return impl_->catalog_name();
 }
@@ -3547,11 +3883,10 @@ transaction::transaction(const transaction& rhs)
 {
 }
 
-#ifndef NANODBC_NO_MOVE_CTOR
-transaction::transaction(transaction&& rhs) NANODBC_NOEXCEPT : impl_(std::move(rhs.impl_))
+transaction::transaction(transaction&& rhs) noexcept
+    : impl_(std::move(rhs.impl_))
 {
 }
-#endif
 
 transaction& transaction::operator=(transaction rhs)
 {
@@ -3559,22 +3894,20 @@ transaction& transaction::operator=(transaction rhs)
     return *this;
 }
 
-void transaction::swap(transaction& rhs) NANODBC_NOEXCEPT
+void transaction::swap(transaction& rhs) noexcept
 {
     using std::swap;
     swap(impl_, rhs.impl_);
 }
 
-transaction::~transaction() NANODBC_NOEXCEPT
-{
-}
+transaction::~transaction() noexcept {}
 
 void transaction::commit()
 {
     impl_->commit();
 }
 
-void transaction::rollback() NANODBC_NOEXCEPT
+void transaction::rollback() noexcept
 {
     impl_->rollback();
 }
@@ -3626,13 +3959,12 @@ statement::statement(class connection& conn)
 {
 }
 
-#ifndef NANODBC_NO_MOVE_CTOR
-statement::statement(statement&& rhs) NANODBC_NOEXCEPT : impl_(std::move(rhs.impl_))
+statement::statement(statement&& rhs) noexcept
+    : impl_(std::move(rhs.impl_))
 {
 }
-#endif
 
-statement::statement(class connection& conn, const string_type& query, long timeout)
+statement::statement(class connection& conn, const string& query, long timeout)
     : impl_(new statement_impl(conn, query, timeout))
 {
 }
@@ -3648,15 +3980,13 @@ statement& statement::operator=(statement rhs)
     return *this;
 }
 
-void statement::swap(statement& rhs) NANODBC_NOEXCEPT
+void statement::swap(statement& rhs) noexcept
 {
     using std::swap;
     swap(impl_, rhs.impl_);
 }
 
-statement::~statement() NANODBC_NOEXCEPT
-{
-}
+statement::~statement() noexcept {}
 
 void statement::open(class connection& conn)
 {
@@ -3698,12 +4028,12 @@ void statement::cancel()
     impl_->cancel();
 }
 
-void statement::prepare(class connection& conn, const string_type& query, long timeout)
+void statement::prepare(class connection& conn, const string& query, long timeout)
 {
     impl_->prepare(conn, query, timeout);
 }
 
-void statement::prepare(const string_type& query, long timeout)
+void statement::prepare(const string& query, long timeout)
 {
     impl_->prepare(query, timeout);
 }
@@ -3715,7 +4045,7 @@ void statement::timeout(long timeout)
 
 result statement::execute_direct(
     class connection& conn,
-    const string_type& query,
+    const string& query,
     long batch_operations,
     long timeout)
 {
@@ -3723,7 +4053,7 @@ result statement::execute_direct(
 }
 
 #if defined(NANODBC_DO_ASYNC_IMPL)
-bool statement::async_prepare(const string_type& query, void* event_handle, long timeout)
+bool statement::async_prepare(const string& query, void* event_handle, long timeout)
 {
     return impl_->async_prepare(query, event_handle, timeout);
 }
@@ -3731,7 +4061,7 @@ bool statement::async_prepare(const string_type& query, void* event_handle, long
 bool statement::async_execute_direct(
     class connection& conn,
     void* event_handle,
-    const string_type& query,
+    const string& query,
     long batch_operations,
     long timeout)
 {
@@ -3771,7 +4101,7 @@ void statement::disable_async() const
 
 void statement::just_execute_direct(
     class connection& conn,
-    const string_type& query,
+    const string& query,
     long batch_operations,
     long timeout)
 {
@@ -3789,10 +4119,10 @@ void statement::just_execute(long batch_operations, long timeout)
 }
 
 result statement::procedure_columns(
-    const string_type& catalog,
-    const string_type& schema,
-    const string_type& procedure,
-    const string_type& column)
+    const string& catalog,
+    const string& schema,
+    const string& procedure,
+    const string& column)
 {
     return impl_->procedure_columns(catalog, schema, procedure, column, *this);
 }
@@ -3812,7 +4142,7 @@ short statement::parameters() const
     return impl_->parameters();
 }
 
-void statement::reset_parameters() NANODBC_NOEXCEPT
+void statement::reset_parameters() noexcept
 {
     impl_->reset_parameters();
 }
@@ -3831,8 +4161,27 @@ unsigned long statement::parameter_size(short param_index) const
     template void statement::bind(                                                                 \
         short, const type*, std::size_t, const bool*, param_direction) /* n-ary, flags */
 
+#define NANODBC_INSTANTIATE_BIND_STRINGS(type)                                                     \
+    template void statement::bind_strings(short, std::vector<type> const&, param_direction);       \
+    template void statement::bind_strings(                                                         \
+        short, std::vector<type> const&, type::value_type const*, param_direction);                \
+    template void statement::bind_strings(                                                         \
+        short, std::vector<type> const&, bool const*, param_direction);                            \
+    template void statement::bind_strings(                                                         \
+        short, const type::value_type*, std::size_t, std::size_t, param_direction);                \
+    template void statement::bind_strings(                                                         \
+        short,                                                                                     \
+        type::value_type const*,                                                                   \
+        std::size_t,                                                                               \
+        std::size_t,                                                                               \
+        type::value_type const*,                                                                   \
+        param_direction);                                                                          \
+    template void statement::bind_strings(                                                         \
+        short, type::value_type const*, std::size_t, std::size_t, bool const*, param_direction)
+
 // The following are the only supported instantiations of statement::bind().
-NANODBC_INSTANTIATE_BINDS(string_type::value_type);
+NANODBC_INSTANTIATE_BINDS(std::string::value_type);
+NANODBC_INSTANTIATE_BINDS(wide_string::value_type);
 NANODBC_INSTANTIATE_BINDS(short);
 NANODBC_INSTANTIATE_BINDS(unsigned short);
 NANODBC_INSTANTIATE_BINDS(int);
@@ -3846,6 +4195,9 @@ NANODBC_INSTANTIATE_BINDS(double);
 NANODBC_INSTANTIATE_BINDS(date);
 NANODBC_INSTANTIATE_BINDS(time);
 NANODBC_INSTANTIATE_BINDS(timestamp);
+
+NANODBC_INSTANTIATE_BIND_STRINGS(std::string);
+NANODBC_INSTANTIATE_BIND_STRINGS(wide_string);
 
 #undef NANODBC_INSTANTIATE_BINDS
 
@@ -3913,17 +4265,19 @@ void statement::bind(
     impl_->bind(direction, param_index, values, nullptr, null_sentry);
 }
 
+template <class T, typename>
 void statement::bind_strings(
     short param_index,
-    std::vector<string_type> const& values,
+    std::vector<T> const& values,
     param_direction direction)
 {
     impl_->bind_strings(direction, param_index, values);
 }
 
+template <class T, typename>
 void statement::bind_strings(
     short param_index,
-    string_type::value_type const* values,
+    T const* values,
     std::size_t value_size,
     std::size_t batch_size,
     param_direction direction)
@@ -3931,21 +4285,23 @@ void statement::bind_strings(
     impl_->bind_strings(direction, param_index, values, value_size, batch_size);
 }
 
+template <class T, typename>
 void statement::bind_strings(
     short param_index,
-    string_type::value_type const* values,
+    T const* values,
     std::size_t value_size,
     std::size_t batch_size,
-    string_type::value_type const* null_sentry,
+    T const* null_sentry,
     param_direction direction)
 {
     impl_->bind_strings(
         direction, param_index, values, value_size, batch_size, nullptr, null_sentry);
 }
 
+template <class T, typename>
 void statement::bind_strings(
     short param_index,
-    string_type::value_type const* values,
+    T const* values,
     std::size_t value_size,
     std::size_t batch_size,
     bool const* nulls,
@@ -3954,18 +4310,20 @@ void statement::bind_strings(
     impl_->bind_strings(direction, param_index, values, value_size, batch_size, nulls);
 }
 
+template <class T, typename>
 void statement::bind_strings(
     short param_index,
-    std::vector<string_type> const& values,
-    string_type::value_type const* null_sentry,
+    std::vector<T> const& values,
+    typename T::value_type const* null_sentry,
     param_direction direction)
 {
     impl_->bind_strings(direction, param_index, values, nullptr, null_sentry);
 }
 
+template <class T, typename>
 void statement::bind_strings(
     short param_index,
-    std::vector<string_type> const& values,
+    std::vector<T> const& values,
     bool const* nulls,
     param_direction direction)
 {
@@ -3975,6 +4333,15 @@ void statement::bind_strings(
 void statement::bind_null(short param_index, std::size_t batch_size)
 {
     impl_->bind_null(param_index, batch_size);
+}
+
+void statement::describe_parameters(
+    const std::vector<short>& idx,
+    const std::vector<short>& type,
+    const std::vector<unsigned long>& size,
+    const std::vector<short>& scale)
+{
+    impl_->describe_parameters(idx, type, size, scale);
 }
 
 } // namespace nanodbc
@@ -3992,34 +4359,34 @@ bool catalog::tables::next()
     return result_.next();
 }
 
-string_type catalog::tables::table_catalog() const
+string catalog::tables::table_catalog() const
 {
     // TABLE_CAT might be NULL
-    return result_.get<string_type>(0, string_type());
+    return result_.get<string>(0, string());
 }
 
-string_type catalog::tables::table_schema() const
+string catalog::tables::table_schema() const
 {
     // TABLE_SCHEM might be NULL
-    return result_.get<string_type>(1, string_type());
+    return result_.get<string>(1, string());
 }
 
-string_type catalog::tables::table_name() const
+string catalog::tables::table_name() const
 {
-    // TABLE_NAME might be NULL
-    return result_.get<string_type>(2, string_type());
+    // TABLE_NAME column is never NULL
+    return result_.get<string>(2);
 }
 
-string_type catalog::tables::table_type() const
+string catalog::tables::table_type() const
 {
-    // TABLE_TYPE might be NULL
-    return result_.get<string_type>(3, string_type());
+    // TABLE_TYPE column is never NULL
+    return result_.get<string>(3);
 }
 
-string_type catalog::tables::table_remarks() const
+string catalog::tables::table_remarks() const
 {
     // REMARKS might be NULL
-    return result_.get<string_type>(4, string_type());
+    return result_.get<string>(4, string());
 }
 
 catalog::table_privileges::table_privileges(result& find_result)
@@ -4032,46 +4399,46 @@ bool catalog::table_privileges::next()
     return result_.next();
 }
 
-string_type catalog::table_privileges::table_catalog() const
+string catalog::table_privileges::table_catalog() const
 {
     // TABLE_CAT might be NULL
-    return result_.get<string_type>(0, string_type());
+    return result_.get<string>(0, string());
 }
 
-string_type catalog::table_privileges::table_schema() const
+string catalog::table_privileges::table_schema() const
 {
     // TABLE_SCHEM might be NULL
-    return result_.get<string_type>(1, string_type());
+    return result_.get<string>(1, string());
 }
 
-string_type catalog::table_privileges::table_name() const
+string catalog::table_privileges::table_name() const
 {
     // TABLE_NAME column is never NULL
-    return result_.get<string_type>(2);
+    return result_.get<string>(2);
 }
 
-string_type catalog::table_privileges::grantor() const
+string catalog::table_privileges::grantor() const
 {
     // GRANTOR might be NULL
-    return result_.get<string_type>(3, string_type());
+    return result_.get<string>(3, string());
 }
 
-string_type catalog::table_privileges::grantee() const
+string catalog::table_privileges::grantee() const
 {
     // GRANTEE column is never NULL
-    return result_.get<string_type>(4);
+    return result_.get<string>(4);
 }
 
-string_type catalog::table_privileges::privilege() const
+string catalog::table_privileges::privilege() const
 {
     // PRIVILEGE column is never NULL
-    return result_.get<string_type>(5);
+    return result_.get<string>(5);
 }
 
-string_type catalog::table_privileges::is_grantable() const
+string catalog::table_privileges::is_grantable() const
 {
     // IS_GRANTABLE might be NULL
-    return result_.get<string_type>(6, string_type());
+    return result_.get<string>(6, string());
 }
 
 catalog::primary_keys::primary_keys(result& find_result)
@@ -4084,28 +4451,28 @@ bool catalog::primary_keys::next()
     return result_.next();
 }
 
-string_type catalog::primary_keys::table_catalog() const
+string catalog::primary_keys::table_catalog() const
 {
     // TABLE_CAT might be NULL
-    return result_.get<string_type>(0, string_type());
+    return result_.get<string>(0, string());
 }
 
-string_type catalog::primary_keys::table_schema() const
+string catalog::primary_keys::table_schema() const
 {
     // TABLE_SCHEM might be NULL
-    return result_.get<string_type>(1, string_type());
+    return result_.get<string>(1, string());
 }
 
-string_type catalog::primary_keys::table_name() const
+string catalog::primary_keys::table_name() const
 {
     // TABLE_NAME is never NULL
-    return result_.get<string_type>(2);
+    return result_.get<string>(2);
 }
 
-string_type catalog::primary_keys::column_name() const
+string catalog::primary_keys::column_name() const
 {
     // COLUMN_NAME is never NULL
-    return result_.get<string_type>(3);
+    return result_.get<string>(3);
 }
 
 short catalog::primary_keys::column_number() const
@@ -4114,10 +4481,10 @@ short catalog::primary_keys::column_number() const
     return result_.get<short>(4);
 }
 
-string_type catalog::primary_keys::primary_key_name() const
+string catalog::primary_keys::primary_key_name() const
 {
     // PK_NAME might be NULL
-    return result_.get<string_type>(5);
+    return result_.get<string>(5);
 }
 
 catalog::columns::columns(result& find_result)
@@ -4130,28 +4497,28 @@ bool catalog::columns::next()
     return result_.next();
 }
 
-string_type catalog::columns::table_catalog() const
+string catalog::columns::table_catalog() const
 {
     // TABLE_CAT might be NULL
-    return result_.get<string_type>(0, string_type());
+    return result_.get<string>(0, string());
 }
 
-string_type catalog::columns::table_schema() const
+string catalog::columns::table_schema() const
 {
     // TABLE_SCHEM might be NULL
-    return result_.get<string_type>(1, string_type());
+    return result_.get<string>(1, string());
 }
 
-string_type catalog::columns::table_name() const
+string catalog::columns::table_name() const
 {
     // TABLE_NAME is never NULL
-    return result_.get<string_type>(2);
+    return result_.get<string>(2);
 }
 
-string_type catalog::columns::column_name() const
+string catalog::columns::column_name() const
 {
     // COLUMN_NAME is never NULL
-    return result_.get<string_type>(3);
+    return result_.get<string>(3);
 }
 
 short catalog::columns::data_type() const
@@ -4160,10 +4527,10 @@ short catalog::columns::data_type() const
     return result_.get<short>(4);
 }
 
-string_type catalog::columns::type_name() const
+string catalog::columns::type_name() const
 {
     // TYPE_NAME is never NULL
-    return result_.get<string_type>(5);
+    return result_.get<string>(5);
 }
 
 long catalog::columns::column_size() const
@@ -4196,16 +4563,16 @@ short catalog::columns::nullable() const
     return result_.get<short>(10);
 }
 
-string_type catalog::columns::remarks() const
+string catalog::columns::remarks() const
 {
     // REMARKS might be NULL
-    return result_.get<string_type>(11, string_type());
+    return result_.get<string>(11, string());
 }
 
-string_type catalog::columns::column_default() const
+string catalog::columns::column_default() const
 {
     // COLUMN_DEF might be NULL, if no default value is specified
-    return result_.get<string_type>(12, string_type());
+    return result_.get<string>(12, string());
 }
 
 short catalog::columns::sql_data_type() const
@@ -4232,10 +4599,10 @@ long catalog::columns::ordinal_position() const
     return result_.get<long>(16);
 }
 
-string_type catalog::columns::is_nullable() const
+string catalog::columns::is_nullable() const
 {
     // IS_NULLABLE might be NULL.
-    return result_.get<string_type>(17, string_type());
+    return result_.get<string>(17, string());
 }
 
 catalog::catalog(connection& conn)
@@ -4244,10 +4611,10 @@ catalog::catalog(connection& conn)
 }
 
 catalog::tables catalog::find_tables(
-    const string_type::value_type* table,
-    const string_type::value_type* type,
-    const string_type::value_type* schema,
-    const string_type::value_type* catalog)
+    const string& table,
+    const string& type,
+    const string& schema,
+    const string& catalog)
 {
     // Passing a null pointer to a search pattern argument does not
     // constrain the search for that argument; that is, a null pointer and
@@ -4262,14 +4629,14 @@ catalog::tables catalog::find_tables(
         NANODBC_FUNC(SQLTables),
         rc,
         stmt.native_statement_handle(),
-        (NANODBC_SQLCHAR*)(catalog),
-        (catalog == nullptr ? 0 : SQL_NTS),
-        (NANODBC_SQLCHAR*)(schema),
-        (schema == nullptr ? 0 : SQL_NTS),
-        (NANODBC_SQLCHAR*)(table),
-        (table == nullptr ? 0 : SQL_NTS),
-        (NANODBC_SQLCHAR*)(type),
-        (type == nullptr ? 0 : SQL_NTS));
+        (NANODBC_SQLCHAR*)(catalog.empty() ? nullptr : catalog.c_str()),
+        (catalog.empty() ? 0 : SQL_NTS),
+        (NANODBC_SQLCHAR*)(schema.empty() ? nullptr : schema.c_str()),
+        (schema.empty() ? 0 : SQL_NTS),
+        (NANODBC_SQLCHAR*)(table.empty() ? nullptr : table.c_str()),
+        (table.empty() ? 0 : SQL_NTS),
+        (NANODBC_SQLCHAR*)(type.empty() ? nullptr : type.c_str()),
+        (type.empty() ? 0 : SQL_NTS));
     if (!success(rc))
         NANODBC_THROW_DATABASE_ERROR(stmt.native_statement_handle(), SQL_HANDLE_STMT);
 
@@ -4277,10 +4644,8 @@ catalog::tables catalog::find_tables(
     return catalog::tables(find_result);
 }
 
-catalog::table_privileges catalog::find_table_privileges(
-    const string_type& catalog,
-    const string_type& table,
-    const string_type& schema)
+catalog::table_privileges
+catalog::find_table_privileges(const string& catalog, const string& table, const string& schema)
 {
     // Passing a null pointer to a search pattern argument does not
     // constrain the search for that argument; that is, a null pointer and
@@ -4309,10 +4674,10 @@ catalog::table_privileges catalog::find_table_privileges(
 }
 
 catalog::columns catalog::find_columns(
-    const string_type& column,
-    const string_type& table,
-    const string_type& schema,
-    const string_type& catalog)
+    const string& column,
+    const string& table,
+    const string& schema,
+    const string& catalog)
 {
     statement stmt(conn_);
     RETCODE rc;
@@ -4335,10 +4700,8 @@ catalog::columns catalog::find_columns(
     return catalog::columns(find_result);
 }
 
-catalog::primary_keys catalog::find_primary_keys(
-    const string_type& table,
-    const string_type& schema,
-    const string_type& catalog)
+catalog::primary_keys
+catalog::find_primary_keys(const string& table, const string& schema, const string& catalog)
 {
     statement stmt(conn_);
     RETCODE rc;
@@ -4359,7 +4722,7 @@ catalog::primary_keys catalog::find_primary_keys(
     return catalog::primary_keys(find_result);
 }
 
-std::list<string_type> catalog::list_catalogs()
+std::list<string> catalog::list_catalogs()
 {
     // Special case for list of catalogs only:
     // all the other arguments must match empty string (""),
@@ -4385,16 +4748,14 @@ std::list<string_type> catalog::list_catalogs()
     result find_result(stmt, 1);
     catalog::tables catalogs(find_result);
 
-    std::list<string_type> names;
+    std::list<string> names;
     while (catalogs.next())
         names.push_back(catalogs.table_catalog());
     return names;
 }
 
-std::list<string_type> catalog::list_schemas()
+std::list<string> catalog::list_schemas()
 {
-    // TODO: Possible to restrict list of schemas from a specified catalog?
-
     // Special case for list of schemas:
     // all the other arguments must match empty string (""),
     // otherwise pattern-based lookup is performed returning
@@ -4419,7 +4780,7 @@ std::list<string_type> catalog::list_schemas()
     result find_result(stmt, 1);
     catalog::tables schemas(find_result);
 
-    std::list<string_type> names;
+    std::list<string> names;
     while (schemas.next())
         names.push_back(schemas.table_schema());
     return names;
@@ -4447,20 +4808,17 @@ result::result()
 {
 }
 
-result::~result() NANODBC_NOEXCEPT
-{
-}
+result::~result() noexcept {}
 
 result::result(statement stmt, long rowset_size)
     : impl_(new result_impl(stmt, rowset_size))
 {
 }
 
-#ifndef NANODBC_NO_MOVE_CTOR
-result::result(result&& rhs) NANODBC_NOEXCEPT : impl_(std::move(rhs.impl_))
+result::result(result&& rhs) noexcept
+    : impl_(std::move(rhs.impl_))
 {
 }
-#endif
 
 result::result(const result& rhs)
     : impl_(rhs.impl_)
@@ -4473,7 +4831,7 @@ result& result::operator=(result rhs)
     return *this;
 }
 
-void result::swap(result& rhs) NANODBC_NOEXCEPT
+void result::swap(result& rhs) noexcept
 {
     using std::swap;
     swap(impl_, rhs.impl_);
@@ -4484,7 +4842,7 @@ void* result::native_statement_handle() const
     return impl_->native_statement_handle();
 }
 
-long result::rowset_size() const NANODBC_NOEXCEPT
+long result::rowset_size() const noexcept
 {
     return impl_->rowset_size();
 }
@@ -4494,7 +4852,12 @@ long result::affected_rows() const
     return impl_->affected_rows();
 }
 
-long result::rows() const NANODBC_NOEXCEPT
+bool result::has_affected_rows() const
+{
+    return impl_->has_affected_rows();
+}
+
+long result::rows() const noexcept
 {
     return impl_->rows();
 }
@@ -4551,7 +4914,7 @@ unsigned long result::position() const
     return impl_->position();
 }
 
-bool result::at_end() const NANODBC_NOEXCEPT
+bool result::at_end() const noexcept
 {
     return impl_->at_end();
 }
@@ -4561,17 +4924,27 @@ bool result::is_null(short column) const
     return impl_->is_null(column);
 }
 
-bool result::is_null(const string_type& column_name) const
+bool result::is_null(const string& column_name) const
 {
     return impl_->is_null(column_name);
 }
 
-short result::column(const string_type& column_name) const
+bool result::is_bound(short column) const
+{
+    return impl_->is_bound(column);
+}
+
+bool result::is_bound(const string& column_name) const
+{
+    return impl_->is_bound(column_name);
+}
+
+short result::column(const string& column_name) const
 {
     return impl_->column(column_name);
 }
 
-string_type result::column_name(short column) const
+string result::column_name(short column) const
 {
     return impl_->column_name(column);
 }
@@ -4581,7 +4954,7 @@ long result::column_size(short column) const
     return impl_->column_size(column);
 }
 
-long result::column_size(const string_type& column_name) const
+long result::column_size(const string& column_name) const
 {
     return impl_->column_size(column_name);
 }
@@ -4591,7 +4964,7 @@ int result::column_decimal_digits(short column) const
     return impl_->column_decimal_digits(column);
 }
 
-int result::column_decimal_digits(const string_type& column_name) const
+int result::column_decimal_digits(const string& column_name) const
 {
     return impl_->column_decimal_digits(column_name);
 }
@@ -4601,9 +4974,19 @@ int result::column_datatype(short column) const
     return impl_->column_datatype(column);
 }
 
-int result::column_datatype(const string_type& column_name) const
+int result::column_datatype(const string& column_name) const
 {
     return impl_->column_datatype(column_name);
+}
+
+string result::column_datatype_name(short column) const
+{
+    return impl_->column_datatype_name(column);
+}
+
+string result::column_datatype_name(const string& column_name) const
+{
+    return impl_->column_datatype_name(column_name);
 }
 
 int result::column_c_datatype(short column) const
@@ -4611,7 +4994,7 @@ int result::column_c_datatype(short column) const
     return impl_->column_c_datatype(column);
 }
 
-int result::column_c_datatype(const string_type& column_name) const
+int result::column_c_datatype(const string& column_name) const
 {
     return impl_->column_c_datatype(column_name);
 }
@@ -4619,6 +5002,21 @@ int result::column_c_datatype(const string_type& column_name) const
 bool result::next_result()
 {
     return impl_->next_result();
+}
+
+void result::unbind()
+{
+    impl_->unbind();
+}
+
+void result::unbind(short column)
+{
+    impl_->unbind(column);
+}
+
+void result::unbind(const string& column_name)
+{
+    impl_->unbind(column_name);
 }
 
 template <class T>
@@ -4634,13 +5032,13 @@ void result::get_ref(short column, const T& fallback, T& result) const
 }
 
 template <class T>
-void result::get_ref(const string_type& column_name, T& result) const
+void result::get_ref(const string& column_name, T& result) const
 {
     return impl_->get_ref<T>(column_name, result);
 }
 
 template <class T>
-void result::get_ref(const string_type& column_name, const T& fallback, T& result) const
+void result::get_ref(const string& column_name, const T& fallback, T& result) const
 {
     return impl_->get_ref<T>(column_name, fallback, result);
 }
@@ -4658,13 +5056,13 @@ T result::get(short column, const T& fallback) const
 }
 
 template <class T>
-T result::get(const string_type& column_name) const
+T result::get(const string& column_name) const
 {
     return impl_->get<T>(column_name);
 }
 
 template <class T>
-T result::get(const string_type& column_name, const T& fallback) const
+T result::get(const string& column_name, const T& fallback) const
 {
     return impl_->get<T>(column_name, fallback);
 }
@@ -4675,7 +5073,8 @@ result::operator bool() const
 }
 
 // The following are the only supported instantiations of result::get_ref().
-template void result::get_ref(short, string_type::value_type&) const;
+template void result::get_ref(short, std::string::value_type&) const;
+template void result::get_ref(short, wide_string::value_type&) const;
 template void result::get_ref(short, short&) const;
 template void result::get_ref(short, unsigned short&) const;
 template void result::get_ref(short, int&) const;
@@ -4686,32 +5085,35 @@ template void result::get_ref(short, long long int&) const;
 template void result::get_ref(short, unsigned long long int&) const;
 template void result::get_ref(short, float&) const;
 template void result::get_ref(short, double&) const;
-template void result::get_ref(short, string_type&) const;
+template void result::get_ref(short, string&) const;
 template void result::get_ref(short, date&) const;
 template void result::get_ref(short, time&) const;
 template void result::get_ref(short, timestamp&) const;
 template void result::get_ref(short, std::vector<std::uint8_t>&) const;
 
-template void result::get_ref(const string_type&, string_type::value_type&) const;
-template void result::get_ref(const string_type&, short&) const;
-template void result::get_ref(const string_type&, unsigned short&) const;
-template void result::get_ref(const string_type&, int&) const;
-template void result::get_ref(const string_type&, unsigned int&) const;
-template void result::get_ref(const string_type&, long int&) const;
-template void result::get_ref(const string_type&, unsigned long int&) const;
-template void result::get_ref(const string_type&, long long int&) const;
-template void result::get_ref(const string_type&, unsigned long long int&) const;
-template void result::get_ref(const string_type&, float&) const;
-template void result::get_ref(const string_type&, double&) const;
-template void result::get_ref(const string_type&, string_type&) const;
-template void result::get_ref(const string_type&, date&) const;
-template void result::get_ref(const string_type&, time&) const;
-template void result::get_ref(const string_type&, timestamp&) const;
-template void result::get_ref(const string_type&, std::vector<std::uint8_t>&) const;
+template void result::get_ref(const string&, std::string::value_type&) const;
+template void result::get_ref(const string&, wide_string::value_type&) const;
+template void result::get_ref(const string&, short&) const;
+template void result::get_ref(const string&, unsigned short&) const;
+template void result::get_ref(const string&, int&) const;
+template void result::get_ref(const string&, unsigned int&) const;
+template void result::get_ref(const string&, long int&) const;
+template void result::get_ref(const string&, unsigned long int&) const;
+template void result::get_ref(const string&, long long int&) const;
+template void result::get_ref(const string&, unsigned long long int&) const;
+template void result::get_ref(const string&, float&) const;
+template void result::get_ref(const string&, double&) const;
+template void result::get_ref(const string&, string&) const;
+template void result::get_ref(const string&, date&) const;
+template void result::get_ref(const string&, time&) const;
+template void result::get_ref(const string&, timestamp&) const;
+template void result::get_ref(const string&, std::vector<std::uint8_t>&) const;
 
 // The following are the only supported instantiations of result::get_ref() with fallback.
 template void
-result::get_ref(short, const string_type::value_type&, string_type::value_type&) const;
+result::get_ref(short, const std::string::value_type&, std::string::value_type&) const;
+template void
+result::get_ref(short, const wide_string::value_type&, wide_string::value_type&) const;
 template void result::get_ref(short, const short&, short&) const;
 template void result::get_ref(short, const unsigned short&, unsigned short&) const;
 template void result::get_ref(short, const int&, int&) const;
@@ -4722,7 +5124,7 @@ template void result::get_ref(short, const long long int&, long long int&) const
 template void result::get_ref(short, const unsigned long long int&, unsigned long long int&) const;
 template void result::get_ref(short, const float&, float&) const;
 template void result::get_ref(short, const double&, double&) const;
-template void result::get_ref(short, const string_type&, string_type&) const;
+template void result::get_ref(short, const string&, string&) const;
 template void result::get_ref(short, const date&, date&) const;
 template void result::get_ref(short, const time&, time&) const;
 template void result::get_ref(short, const timestamp&, timestamp&) const;
@@ -4730,30 +5132,31 @@ template void
 result::get_ref(short, const std::vector<std::uint8_t>&, std::vector<std::uint8_t>&) const;
 
 template void
-result::get_ref(const string_type&, const string_type::value_type&, string_type::value_type&) const;
-template void result::get_ref(const string_type&, const short&, short&) const;
-template void result::get_ref(const string_type&, const unsigned short&, unsigned short&) const;
-template void result::get_ref(const string_type&, const int&, int&) const;
-template void result::get_ref(const string_type&, const unsigned int&, unsigned int&) const;
-template void result::get_ref(const string_type&, const long int&, long int&) const;
+result::get_ref(const string&, const std::string::value_type&, std::string::value_type&) const;
 template void
-result::get_ref(const string_type&, const unsigned long int&, unsigned long int&) const;
-template void result::get_ref(const string_type&, const long long int&, long long int&) const;
+result::get_ref(const string&, const wide_string::value_type&, wide_string::value_type&) const;
+template void result::get_ref(const string&, const short&, short&) const;
+template void result::get_ref(const string&, const unsigned short&, unsigned short&) const;
+template void result::get_ref(const string&, const int&, int&) const;
+template void result::get_ref(const string&, const unsigned int&, unsigned int&) const;
+template void result::get_ref(const string&, const long int&, long int&) const;
+template void result::get_ref(const string&, const unsigned long int&, unsigned long int&) const;
+template void result::get_ref(const string&, const long long int&, long long int&) const;
 template void
-result::get_ref(const string_type&, const unsigned long long int&, unsigned long long int&) const;
-template void result::get_ref(const string_type&, const float&, float&) const;
-template void result::get_ref(const string_type&, const double&, double&) const;
-template void result::get_ref(const string_type&, const string_type&, string_type&) const;
-template void result::get_ref(const string_type&, const date&, date&) const;
-template void result::get_ref(const string_type&, const time&, time&) const;
-template void result::get_ref(const string_type&, const timestamp&, timestamp&) const;
-template void result::get_ref(
-    const string_type&,
-    const std::vector<std::uint8_t>&,
-    std::vector<std::uint8_t>&) const;
+result::get_ref(const string&, const unsigned long long int&, unsigned long long int&) const;
+template void result::get_ref(const string&, const float&, float&) const;
+template void result::get_ref(const string&, const double&, double&) const;
+template void result::get_ref(const string&, const std::string&, std::string&) const;
+template void result::get_ref(const string&, const wide_string&, wide_string&) const;
+template void result::get_ref(const string&, const date&, date&) const;
+template void result::get_ref(const string&, const time&, time&) const;
+template void result::get_ref(const string&, const timestamp&, timestamp&) const;
+template void
+result::get_ref(const string&, const std::vector<std::uint8_t>&, std::vector<std::uint8_t>&) const;
 
 // The following are the only supported instantiations of result::get().
-template string_type::value_type result::get(short) const;
+template std::string::value_type result::get(short) const;
+template wide_string::value_type result::get(short) const;
 template short result::get(short) const;
 template unsigned short result::get(short) const;
 template int result::get(short) const;
@@ -4764,31 +5167,35 @@ template long long int result::get(short) const;
 template unsigned long long int result::get(short) const;
 template float result::get(short) const;
 template double result::get(short) const;
-template string_type result::get(short) const;
+template std::string result::get(short) const;
+template wide_string result::get(short) const;
 template date result::get(short) const;
 template time result::get(short) const;
 template timestamp result::get(short) const;
 template std::vector<std::uint8_t> result::get(short) const;
 
-template string_type::value_type result::get(const string_type&) const;
-template short result::get(const string_type&) const;
-template unsigned short result::get(const string_type&) const;
-template int result::get(const string_type&) const;
-template unsigned int result::get(const string_type&) const;
-template long int result::get(const string_type&) const;
-template unsigned long int result::get(const string_type&) const;
-template long long int result::get(const string_type&) const;
-template unsigned long long int result::get(const string_type&) const;
-template float result::get(const string_type&) const;
-template double result::get(const string_type&) const;
-template string_type result::get(const string_type&) const;
-template date result::get(const string_type&) const;
-template time result::get(const string_type&) const;
-template timestamp result::get(const string_type&) const;
-template std::vector<std::uint8_t> result::get(const string_type&) const;
+template std::string::value_type result::get(const string&) const;
+template wide_string::value_type result::get(const string&) const;
+template short result::get(const string&) const;
+template unsigned short result::get(const string&) const;
+template int result::get(const string&) const;
+template unsigned int result::get(const string&) const;
+template long int result::get(const string&) const;
+template unsigned long int result::get(const string&) const;
+template long long int result::get(const string&) const;
+template unsigned long long int result::get(const string&) const;
+template float result::get(const string&) const;
+template double result::get(const string&) const;
+template std::string result::get(const string&) const;
+template wide_string result::get(const string&) const;
+template date result::get(const string&) const;
+template time result::get(const string&) const;
+template timestamp result::get(const string&) const;
+template std::vector<std::uint8_t> result::get(const string&) const;
 
 // The following are the only supported instantiations of result::get() with fallback.
-template string_type::value_type result::get(short, const string_type::value_type&) const;
+template std::string::value_type result::get(short, const std::string::value_type&) const;
+template wide_string::value_type result::get(short, const wide_string::value_type&) const;
 template short result::get(short, const short&) const;
 template unsigned short result::get(short, const unsigned short&) const;
 template int result::get(short, const int&) const;
@@ -4799,33 +5206,35 @@ template long long int result::get(short, const long long int&) const;
 template unsigned long long int result::get(short, const unsigned long long int&) const;
 template float result::get(short, const float&) const;
 template double result::get(short, const double&) const;
-template string_type result::get(short, const string_type&) const;
+template std::string result::get(short, const std::string&) const;
+template wide_string result::get(short, const wide_string&) const;
 template date result::get(short, const date&) const;
 template time result::get(short, const time&) const;
 template timestamp result::get(short, const timestamp&) const;
 template std::vector<std::uint8_t> result::get(short, const std::vector<std::uint8_t>&) const;
 
-template string_type::value_type
-result::get(const string_type&, const string_type::value_type&) const;
-template short result::get(const string_type&, const short&) const;
-template unsigned short result::get(const string_type&, const unsigned short&) const;
-template int result::get(const string_type&, const int&) const;
-template unsigned int result::get(const string_type&, const unsigned int&) const;
-template long int result::get(const string_type&, const long int&) const;
-template unsigned long int result::get(const string_type&, const unsigned long int&) const;
-template long long int result::get(const string_type&, const long long int&) const;
-template unsigned long long int
-result::get(const string_type&, const unsigned long long int&) const;
-template float result::get(const string_type&, const float&) const;
-template double result::get(const string_type&, const double&) const;
-template string_type result::get(const string_type&, const string_type&) const;
-template date result::get(const string_type&, const date&) const;
-template time result::get(const string_type&, const time&) const;
-template timestamp result::get(const string_type&, const timestamp&) const;
+template std::string::value_type result::get(const string&, const std::string::value_type&) const;
+template wide_string::value_type result::get(const string&, const wide_string::value_type&) const;
+template short result::get(const string&, const short&) const;
+template unsigned short result::get(const string&, const unsigned short&) const;
+template int result::get(const string&, const int&) const;
+template unsigned int result::get(const string&, const unsigned int&) const;
+template long int result::get(const string&, const long int&) const;
+template unsigned long int result::get(const string&, const unsigned long int&) const;
+template long long int result::get(const string&, const long long int&) const;
+template unsigned long long int result::get(const string&, const unsigned long long int&) const;
+template float result::get(const string&, const float&) const;
+template double result::get(const string&, const double&) const;
+template std::string result::get(const string&, const std::string&) const;
+template wide_string result::get(const string&, const wide_string&) const;
+template date result::get(const string&, const date&) const;
+template time result::get(const string&, const time&) const;
+template timestamp result::get(const string&, const timestamp&) const;
 template std::vector<std::uint8_t>
-result::get(const string_type&, const std::vector<std::uint8_t>&) const;
+result::get(const string&, const std::vector<std::uint8_t>&) const;
 
 } // namespace nanodbc
+#endif // NANODBC_DISABLE_NANODBC_NAMESPACE_FOR_INTERNAL_TESTS
 
 #undef NANODBC_THROW_DATABASE_ERROR
 #undef NANODBC_STRINGIZE

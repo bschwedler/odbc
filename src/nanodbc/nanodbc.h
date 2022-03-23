@@ -6,7 +6,7 @@
 /// This library provides a wrapper API for the native ODBC API. It aims to do everything ODBC does,
 /// but with a \b much nicer interface. Anything it doesn't (yet) do can be done by retrieving the
 /// native ODBC handles and dropping down to straight ODBC C API code.
-/// For more propaganda, please see the <a href="http://lexicalunit.github.com/nanodbc/">project
+/// For more propaganda, please see the <a href="http://nanodbc.io/">project
 /// homepage</a>.
 ///
 /// \section toc Table of Contents
@@ -113,11 +113,18 @@ namespace nanodbc
 // clang-format on
 
 /// \addtogroup macros Macros
-/// \brief Macros that nanodbc uses, can be overriden by users.
+/// \brief Configuration and utility macros that nanodbc uses, can be overriden by users.
 ///
 /// @{
-
 #ifdef DOXYGEN
+
+/// \def NANODBC_THROW_NO_SOURCE_LOCATION
+/// \brief Configures \c nanodbc::database_error message
+///
+/// If defined, removes source file name and line number from \c nanodbc::database_error message
+/// By default, nanodbc includes source location of exception in the error message.
+#define NANODBC_THROW_NO_SOURCE_LOCATION 1
+
 /// \def NANODBC_ASSERT(expression)
 /// \brief Assertion.
 ///
@@ -133,29 +140,41 @@ namespace nanodbc
 /// #endif
 /// \endcode
 #define NANODBC_ASSERT(expression) assert(expression)
-#endif
 
+#endif
 /// @}
 
-// You must explicitly request Unicode support by defining NANODBC_USE_UNICODE at compile time.
+// You must explicitly request Unicode support by defining NANODBC_ENABLE_UNICODE at compile time.
 #ifndef DOXYGEN
-#ifdef NANODBC_USE_UNICODE
+#ifdef NANODBC_ENABLE_UNICODE
 #ifdef NANODBC_USE_IODBC_WIDE_STRINGS
 #define NANODBC_TEXT(s) U##s
-typedef std::u32string string_type;
+typedef std::u32string string;
 #else
 #ifdef _MSC_VER
-typedef std::wstring string_type;
+typedef std::wstring string;
 #define NANODBC_TEXT(s) L##s
 #else
-typedef std::u16string string_type;
+typedef std::u16string string;
 #define NANODBC_TEXT(s) u##s
 #endif
 #endif
 #else
-typedef std::string string_type;
+typedef std::string string;
 #define NANODBC_TEXT(s) s
 #endif
+
+#ifdef NANODBC_USE_IODBC_WIDE_STRINGS
+typedef std::u32string wide_string;
+#else
+#ifdef _MSC_VER
+typedef std::wstring wide_string;
+#else
+typedef std::u16string wide_string;
+#endif
+#endif
+
+typedef wide_string::value_type wide_char_t;
 
 #if defined(_WIN64)
 // LLP64 machine: Windows
@@ -169,30 +188,36 @@ typedef long null_type;
 #endif
 #else
 /// \def NANODBC_TEXT(s)
-/// \brief Creates a string literal of the type corresponding to `nanodbc::string_type`.
+/// \brief Creates a string literal of the type corresponding to `nanodbc::string`.
 ///
 /// By default, the macro maps to an unprefixed string literal.
-/// If building with options NANODBC_USE_UNICODE=ON and
+/// If building with options NANODBC_ENABLE_UNICODE=ON and
 /// NANODBC_USE_IODBC_WIDE_STRINGS=ON specified, then it prefixes a literal with U"...".
-/// If only NANODBC_USE_UNICODE=ON is specified, then:
+/// If only NANODBC_ENABLE_UNICODE=ON is specified, then:
 ///   * If building with Visual Studio, then the macro prefixes a literal with L"...".
 ///   * Otherwise, it prefixes a literal with u"...".
 #define NANODBC_TEXT(s) s
 
-/// \c string_type will be \c std::u16string or \c std::32string if \c NANODBC_USE_UNICODE defined.
+/// \c string will be \c std::u16string or \c std::32string if \c NANODBC_ENABLE_UNICODE
+/// defined.
 ///
 /// Otherwise it will be \c std::string.
-typedef unspecified - type string_type;
+typedef unspecified - type string;
 /// \c null_type will be \c int64_t for 64-bit compilations, otherwise \c long.
 typedef unspecified - type null_type;
 #endif
 
-#if defined(_MSC_VER) && _MSC_VER <= 1800
-// These versions of Visual C++ do not yet support \c noexcept or \c std::move.
-#define NANODBC_NOEXCEPT
-#define NANODBC_NO_MOVE_CTOR
+#if __cplusplus >= 201402L || (defined(_MSVC_LANG) && _MSVC_LANG >= 201402L)
+// [[deprecated]] is only available in C++14
+#define NANODBC_DEPRECATED [[deprecated]]
 #else
-#define NANODBC_NOEXCEPT noexcept
+#ifdef __GNUC__
+#define NANODBC_DEPRECATED __attribute__((deprecated))
+#elif defined(_MSC_VER)
+#define NANODBC_DEPRECATED __declspec(deprecated)
+#else
+#define NANODBC_DEPRECATED
+#endif
 #endif
 
 // clang-format off
@@ -226,7 +251,7 @@ class type_incompatible_error : public std::runtime_error
 {
 public:
     type_incompatible_error();
-    const char* what() const NANODBC_NOEXCEPT;
+    const char* what() const noexcept;
 };
 
 /// \brief Accessed null data.
@@ -235,7 +260,7 @@ class null_access_error : public std::runtime_error
 {
 public:
     null_access_error();
-    const char* what() const NANODBC_NOEXCEPT;
+    const char* what() const noexcept;
 };
 
 /// \brief Index out of range.
@@ -244,7 +269,7 @@ class index_range_error : public std::runtime_error
 {
 public:
     index_range_error();
-    const char* what() const NANODBC_NOEXCEPT;
+    const char* what() const noexcept;
 };
 
 /// \brief Programming logic error.
@@ -253,7 +278,7 @@ class programming_error : public std::runtime_error
 {
 public:
     explicit programming_error(const std::string& info);
-    const char* what() const NANODBC_NOEXCEPT;
+    const char* what() const noexcept;
 };
 
 /// \brief General database error.
@@ -266,9 +291,9 @@ public:
     /// \param handle_type The native ODBC handle type code for the given handle.
     /// \param info Additional info that will be appended to the beginning of the error message.
     database_error(void* handle, short handle_type, const std::string& info = "");
-    const char* what() const NANODBC_NOEXCEPT;
-    const long native() const NANODBC_NOEXCEPT;
-    const std::string state() const NANODBC_NOEXCEPT;
+    const char* what() const noexcept;
+    long native() const noexcept;
+    const std::string state() const noexcept;
 
 private:
     long native_error;
@@ -323,6 +348,28 @@ struct timestamp
     std::int32_t fract; ///< Fractional seconds.
 };
 
+/// \brief A type trait for testing if a type is a std::basic_string compatible with the current
+/// nanodbc configuration
+template <typename T>
+using is_string = std::integral_constant<
+    bool,
+    std::is_same<typename std::decay<T>::type, std::string>::value ||
+        std::is_same<typename std::decay<T>::type, wide_string>::value>;
+
+/// \brief A type trait for testing if a type is a character compatible with the current nanodbc
+/// configuration
+template <typename T>
+using is_character = std::integral_constant<
+    bool,
+    std::is_same<typename std::decay<T>::type, std::string::value_type>::value ||
+        std::is_same<typename std::decay<T>::type, wide_char_t>::value>;
+
+template <typename T>
+using enable_if_string = typename std::enable_if<is_string<T>::value>::type;
+
+template <typename T>
+using enable_if_character = typename std::enable_if<is_character<T>::value>::type;
+
 /// \}
 
 /// \addtogroup mainc Main classes
@@ -356,26 +403,24 @@ public:
     /// Copy constructor.
     transaction(const transaction& rhs);
 
-#ifndef NANODBC_NO_MOVE_CTOR
     /// Move constructor.
-    transaction(transaction&& rhs) NANODBC_NOEXCEPT;
-#endif
+    transaction(transaction&& rhs) noexcept;
 
     /// Assignment.
     transaction& operator=(transaction rhs);
 
     /// Member swap.
-    void swap(transaction& rhs) NANODBC_NOEXCEPT;
+    void swap(transaction& rhs) noexcept;
 
     /// \brief If this transaction has not been committed, will will rollback any modifying ops.
-    ~transaction() NANODBC_NOEXCEPT;
+    ~transaction() noexcept;
 
     /// \brief Commits transaction immediately.
     /// \throws database_error
     void commit();
 
     /// \brief Marks this transaction for rollback.
-    void rollback() NANODBC_NOEXCEPT;
+    void rollback() noexcept;
 
     /// Returns the connection object.
     class connection& connection();
@@ -438,25 +483,23 @@ public:
     /// \param query The SQL query statement.
     /// \param timeout The number in seconds before query timeout. Default: 0 meaning no timeout.
     /// \see execute(), just_execute(), execute_direct(), just_execute_direct(), open(), prepare()
-    statement(class connection& conn, const string_type& query, long timeout = 0);
+    statement(class connection& conn, const string& query, long timeout = 0);
 
     /// \brief Copy constructor.
     statement(const statement& rhs);
 
-#ifndef NANODBC_NO_MOVE_CTOR
     /// \brief Move constructor.
-    statement(statement&& rhs) NANODBC_NOEXCEPT;
-#endif
+    statement(statement&& rhs) noexcept;
 
     /// \brief Assignment.
     statement& operator=(statement rhs);
 
     /// \brief Member swap.
-    void swap(statement& rhs) NANODBC_NOEXCEPT;
+    void swap(statement& rhs) noexcept;
 
     /// \brief Closes the statement.
     /// \see close()
-    ~statement() NANODBC_NOEXCEPT;
+    ~statement() noexcept;
 
     /// \brief Creates a statement for the given connection.
     /// \param conn The connection where the statement will be executed.
@@ -491,7 +534,7 @@ public:
     /// \param timeout The number in seconds before query timeout. Default 0 meaning no timeout.
     /// \see open()
     /// \throws database_error
-    void prepare(class connection& conn, const string_type& query, long timeout = 0);
+    void prepare(class connection& conn, const string& query, long timeout = 0);
 
     /// \brief Prepares the given statement to execute its associated connection.
     /// \note If the statement is not open throws programming_error.
@@ -499,7 +542,7 @@ public:
     /// \param timeout The number in seconds before query timeout. Default 0 meaning no timeout.
     /// \see open()
     /// \throws database_error, programming_error
-    void prepare(const string_type& query, long timeout = 0);
+    void prepare(const string& query, long timeout = 0);
 
     /// \brief Sets the number in seconds before query timeout. Default is 0 indicating no timeout.
     /// \throws database_error
@@ -517,7 +560,7 @@ public:
     /// \see open(), prepare(), execute(), result, transaction
     class result execute_direct(
         class connection& conn,
-        const string_type& query,
+        const string& query,
         long batch_operations = 1,
         long timeout = 0);
 
@@ -538,7 +581,7 @@ public:
     /// \throws database_error
     /// \return Boolean: true if the event handle needs to be awaited, false is result is ready now.
     /// \see complete_prepare()
-    bool async_prepare(const string_type& query, void* event_handle, long timeout = 0);
+    bool async_prepare(const string& query, void* event_handle, long timeout = 0);
 
     /// \brief Completes a previously initiated asynchronous query preparation.
     ///
@@ -575,7 +618,7 @@ public:
     bool async_execute_direct(
         class connection& conn,
         void* event_handle,
-        const string_type& query,
+        const string& query,
         long batch_operations = 1,
         long timeout = 0);
 
@@ -613,8 +656,10 @@ public:
     /// \see async_execute(), async_execute_direct()
     class result complete_execute(long batch_operations = 1);
 
-    /// left for backwards compatibility
-    class result async_complete(long batch_operations = 1);
+    /// \brief Completes a previously initiated asynchronous query execution, returning the result.
+    ///
+    /// \deprecated Use complete_execute instead.
+    NANODBC_DEPRECATED class result async_complete(long batch_operations = 1);
 
     /// undocumented - for internal use only (used from result_impl)
     void enable_async(void* event_handle);
@@ -635,7 +680,7 @@ public:
     /// \see open(), prepare(), execute(), execute_direct(), result, transaction
     void just_execute_direct(
         class connection& conn,
-        const string_type& query,
+        const string& query,
         long batch_operations = 1,
         long timeout = 0);
 
@@ -667,10 +712,10 @@ public:
     /// \throws database_error
     /// \return A result set object.
     class result procedure_columns(
-        const string_type& catalog,
-        const string_type& schema,
-        const string_type& procedure,
-        const string_type& column);
+        const string& catalog,
+        const string& schema,
+        const string& procedure,
+        const string& column);
 
     /// \brief Returns rows affected by the request or -1 if affected rows is not available.
     /// \throws database_error
@@ -681,7 +726,7 @@ public:
     short columns() const;
 
     /// \brief Resets all currently bound parameters.
-    void reset_parameters() NANODBC_NOEXCEPT;
+    void reset_parameters() noexcept;
 
     /// \brief Returns the number of parameters in the statement.
     /// \throws database_error
@@ -724,7 +769,7 @@ public:
     /// \param batch_size The number of values being bound.
     /// \param null_sentry Value which should represent a null value.
     /// \param nulls Flags for values that should be set to a null value.
-    /// \param param_direciton ODBC parameter direction.
+    /// \param param_direction ODBC parameter direction.
     /// \throws database_error
     ///
     /// @{
@@ -799,16 +844,17 @@ public:
     /// taken as the number of values.
     /// \param null_sentry Value which should represent a null value.
     /// \param nulls Flags for values that should be set to a null value.
-    /// \param param_direciton ODBC parameter direction.
+    /// \param param_direction ODBC parameter direction.
     /// \throws database_error
     ///
     /// @{
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
+    template <class T, typename = enable_if_character<T>>
     void bind_strings(
         short param_index,
-        string_type::value_type const* values,
+        T const* values,
         std::size_t value_size,
         std::size_t batch_size,
         param_direction direction = PARAM_IN);
@@ -819,59 +865,71 @@ public:
     /// Longest string in the array determines maximum length of individual value.
     ///
     /// \see bind_strings
+    template <class T, typename = enable_if_string<T>>
     void bind_strings(
         short param_index,
-        std::vector<string_type> const& values,
+        std::vector<T> const& values,
         param_direction direction = PARAM_IN);
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
-    template <std::size_t BatchSize, std::size_t ValueSize>
+    template <
+        std::size_t BatchSize,
+        std::size_t ValueSize,
+        class T,
+        typename = enable_if_character<T>>
     void bind_strings(
         short param_index,
-        string_type::value_type const (&values)[BatchSize][ValueSize],
+        T const (&values)[BatchSize][ValueSize],
         param_direction direction = PARAM_IN)
     {
-        auto param_values = reinterpret_cast<string_type::value_type const*>(values);
+        auto param_values = reinterpret_cast<T const*>(values);
         bind_strings(param_index, param_values, ValueSize, BatchSize, direction);
     }
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
+    template <class T, typename = enable_if_character<T>>
     void bind_strings(
         short param_index,
-        string_type::value_type const* values,
+        T const* values,
         std::size_t value_size,
         std::size_t batch_size,
-        string_type::value_type const* null_sentry,
+        T const* null_sentry,
         param_direction direction = PARAM_IN);
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
+    template <class T, typename = enable_if_string<T>>
     void bind_strings(
         short param_index,
-        std::vector<string_type> const& values,
-        string_type::value_type const* null_sentry,
+        std::vector<T> const& values,
+        typename T::value_type const* null_sentry,
         param_direction direction = PARAM_IN);
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
-    template <std::size_t BatchSize, std::size_t ValueSize>
+    template <
+        std::size_t BatchSize,
+        std::size_t ValueSize,
+        class T,
+        typename = enable_if_character<T>>
     void bind_strings(
         short param_index,
-        string_type::value_type const (&values)[BatchSize][ValueSize],
-        string_type::value_type const* null_sentry,
+        T const (&values)[BatchSize][ValueSize],
+        T const* null_sentry,
         param_direction direction = PARAM_IN)
     {
-        auto param_values = reinterpret_cast<string_type::value_type const*>(values);
+        auto param_values = reinterpret_cast<T const*>(values);
         bind_strings(param_index, param_values, ValueSize, BatchSize, null_sentry, direction);
     }
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
+    template <class T, typename = enable_if_character<T>>
     void bind_strings(
         short param_index,
-        string_type::value_type const* values,
+        T const* values,
         std::size_t value_size,
         std::size_t batch_size,
         bool const* nulls,
@@ -879,22 +937,27 @@ public:
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
+    template <class T, typename = enable_if_string<T>>
     void bind_strings(
         short param_index,
-        std::vector<string_type> const& values,
+        std::vector<T> const& values,
         bool const* nulls,
         param_direction direction = PARAM_IN);
 
     /// \brief Binds multiple string values.
     /// \see bind_strings
-    template <std::size_t BatchSize, std::size_t ValueSize>
+    template <
+        std::size_t BatchSize,
+        std::size_t ValueSize,
+        class T,
+        typename = enable_if_character<T>>
     void bind_strings(
         short param_index,
-        string_type::value_type const (&values)[BatchSize][ValueSize],
+        T const (&values)[BatchSize][ValueSize],
         bool const* nulls,
         param_direction direction = PARAM_IN)
     {
-        auto param_values = reinterpret_cast<string_type::value_type const*>(values);
+        auto param_values = reinterpret_cast<T const*>(values);
         bind_strings(param_index, param_values, ValueSize, BatchSize, nulls, direction);
     }
 
@@ -915,6 +978,30 @@ public:
 
     /// @}
 
+    /// \brief Sets descriptions for parameters in the prepared statement.
+    ///
+    /// If your prepared SQL query has any parameter markers, ? (question  mark)
+    /// placeholders this is how you can describe the SQL type, size and scale
+    /// for some or all of the parameters, prior to binding any data to the
+    /// parameters.  Calling this method is optional: if a parameter is not
+    /// described using a call to this method, then during a bind an attempt is
+    /// made to identify it using a call to the ODBC SQLDescribeParam API handle.
+    /// Once set, description is re-used for possibly repeated binds
+    /// execution and only cleared when the statement is cleared / destroyed.
+    /// Parameter markers are numbered using Zero-based index from left to right.
+    ///
+    /// \param idx Vector of zero-based indices of parameters we are describing.
+    /// \param type Vector of (short integer) types.
+    /// \param size Vector of (unsigned long) sizes.
+    /// \param scale Vector of (short integer) decimal precision / scale.
+    /// \throws programming_error
+    void describe_parameters(
+        const std::vector<short>& idx,
+        const std::vector<short>& type,
+        const std::vector<unsigned long>& size,
+        const std::vector<short>& scale);
+
+    /// @}
 private:
     typedef std::function<bool(std::size_t)> null_predicate_type;
 
@@ -948,43 +1035,57 @@ public:
     /// Copy constructor.
     connection(const connection& rhs);
 
-#ifndef NANODBC_NO_MOVE_CTOR
     /// Move constructor.
-    connection(connection&& rhs) NANODBC_NOEXCEPT;
-#endif
+    connection(connection&& rhs) noexcept;
 
     /// Assignment.
     connection& operator=(connection rhs);
 
     /// Member swap.
-    void swap(connection&) NANODBC_NOEXCEPT;
+    void swap(connection&) noexcept;
 
     /// \brief Create new connection object and immediately connect to the given data source.
-    /// \param dsn The name of the data source.
+    ///
+    /// The function calls ODBC API SQLConnect.
+    ///
+    /// \param dsn The name of the data source name (DSN).
     /// \param user The username for authenticating to the data source.
     /// \param pass The password for authenticating to the data source.
     /// \param timeout Seconds before connection timeout. Default 0 meaning no timeout.
     /// \throws database_error
     /// \see connected(), connect()
-    connection(
-        const string_type& dsn,
-        const string_type& user,
-        const string_type& pass,
-        long timeout = 0);
+    connection(const string& dsn, const string& user, const string& pass, long timeout = 0);
 
     /// \brief Create new connection object and immediately connect using the given connection
     /// string.
+    ///
+    /// The function calls ODBC API SQLDriverConnect.
+    ///
     /// \param connection_string The connection string for establishing a connection.
     /// \param timeout Seconds before connection timeout. Default is 0 indicating no timeout.
     /// \throws database_error
     /// \see connected(), connect()
-    connection(const string_type& connection_string, long timeout = 0);
+    connection(const string& connection_string, long timeout = 0);
 
     /// \brief Automatically disconnects from the database and frees all associated resources.
     ///
     /// Will not throw even if disconnecting causes some kind of error and raises an exception.
     /// If you explicitly need to know if disconnect() succeeds, call it directly.
-    ~connection() NANODBC_NOEXCEPT;
+    ~connection() noexcept;
+
+    /// \brief Allocate environment and connection handles.
+    ///
+    /// Allows on-demand allocation of handles to configure the ODBC environment
+    /// and attributes, before database connection is established.
+    /// Typically, user does not have to make this call explicitly.
+    ///
+    /// \throws database_error
+    /// \see deallocate()
+    void allocate();
+
+    /// \brief Release environment and connection handles.
+    /// \see allocate()
+    void deallocate();
 
     /// \brief Connect to the given data source.
     /// \param dsn The name of the data source.
@@ -993,18 +1094,14 @@ public:
     /// \param timeout Seconds before connection timeout. Default is 0 indicating no timeout.
     /// \throws database_error
     /// \see connected()
-    void connect(
-        const string_type& dsn,
-        const string_type& user,
-        const string_type& pass,
-        long timeout = 0);
+    void connect(const string& dsn, const string& user, const string& pass, long timeout = 0);
 
     /// \brief Connect using the given connection string.
     /// \param connection_string The connection string for establishing a connection.
     /// \param timeout Seconds before connection timeout. Default is 0 indicating no timeout.
     /// \throws database_error
     /// \see connected()
-    void connect(const string_type& connection_string, long timeout = 0);
+    void connect(const string& connection_string, long timeout = 0);
 
 #if !defined(NANODBC_DISABLE_ASYNC)
     /// \brief Initiate an asynchronous connection operation to the given data source.
@@ -1025,9 +1122,9 @@ public:
     /// \return Boolean: true if event handle needs to be awaited, false if connection is ready now.
     /// \see connected()
     bool async_connect(
-        const string_type& dsn,
-        const string_type& user,
-        const string_type& pass,
+        const string& dsn,
+        const string& user,
+        const string& pass,
         void* event_handle,
         long timeout = 0);
 
@@ -1046,7 +1143,7 @@ public:
     /// \throws database_error
     /// \return Boolean: true if event handle needs to be awaited, false if connection is ready now.
     /// \see connected()
-    bool async_connect(const string_type& connection_string, void* event_handle, long timeout = 0);
+    bool async_connect(const string& connection_string, void* event_handle, long timeout = 0);
 
     /// \brief Completes a previously initiated asynchronous connection operation.
     ///
@@ -1070,31 +1167,33 @@ public:
     /// \brief Returns the native ODBC environment handle.
     void* native_env_handle() const;
 
-    /// \brief Returns information from the ODBC connection as a string.
+    /// \brief Returns information from the ODBC connection as a string or fixed-size value.
+    /// The general information about the driver and data source associated
+    /// with a connection is obtained using `SQLGetInfo` function.
     template <class T>
     T get_info(short info_type) const;
 
     /// \brief Returns name of the DBMS product.
     /// Returns the ODBC information type SQL_DBMS_NAME of the DBMS product
     /// accesssed by the driver via the current connection.
-    string_type dbms_name() const;
+    string dbms_name() const;
 
     /// \brief Returns version of the DBMS product.
     /// Returns the ODBC information type SQL_DBMS_VER of the DBMS product
     /// accesssed by the driver via the current connection.
-    string_type dbms_version() const;
+    string dbms_version() const;
 
     /// \brief Returns the name of the ODBC driver.
     /// \throws database_error
-    string_type driver_name() const;
+    string driver_name() const;
 
     /// \brief Returns the name of the currently connected database.
     /// Returns the current SQL_DATABASE_NAME information value associated with the connection.
-    string_type database_name() const;
+    string database_name() const;
 
     /// \brief Returns the name of the current catalog.
     /// Returns the current setting of the connection attribute SQL_ATTR_CURRENT_CATALOG.
-    string_type catalog_name() const;
+    string catalog_name() const;
 
 private:
     std::size_t ref_transaction();
@@ -1135,34 +1234,41 @@ public:
     result();
 
     /// \brief Free result set.
-    ~result() NANODBC_NOEXCEPT;
+    ~result() noexcept;
 
     /// \brief Copy constructor.
     result(const result& rhs);
 
-#ifndef NANODBC_NO_MOVE_CTOR
     /// \brief Move constructor.
-    result(result&& rhs) NANODBC_NOEXCEPT;
-#endif
+    result(result&& rhs) noexcept;
 
     /// \brief Assignment.
     result& operator=(result rhs);
 
     /// \brief Member swap.
-    void swap(result& rhs) NANODBC_NOEXCEPT;
+    void swap(result& rhs) noexcept;
 
     /// \brief Returns the native ODBC statement handle.
     void* native_statement_handle() const;
 
     /// \brief The rowset size for this result set.
-    long rowset_size() const NANODBC_NOEXCEPT;
+    long rowset_size() const noexcept;
 
     /// \brief Number of affected rows by the request or -1 if the affected rows is not available.
     /// \throws database_error
     long affected_rows() const;
 
+    /// \brief Reports if number of affected rows is available.
+    /// \return true if number of affected rows is known, regardless of the value;
+    /// false if the number is not available.
+    /// \throws database_error
+    /// \code{.cpp}
+    /// assert(r.has_affected_rows() == (r.affected_rows() >= 0));
+    /// \endcode
+    bool has_affected_rows() const;
+
     /// \brief Rows in the current rowset or 0 if the number of rows is not available.
-    long rows() const NANODBC_NOEXCEPT;
+    long rows() const noexcept;
 
     /// \brief Returns the number of columns in a result set.
     /// \throws database_error
@@ -1215,7 +1321,37 @@ public:
     unsigned long position() const;
 
     /// \brief Returns true if there are no more results in the current result set.
-    bool at_end() const NANODBC_NOEXCEPT;
+    bool at_end() const noexcept;
+
+    /// \brief Unbind data buffers for all columns in the result set.
+    ///
+    /// Wraps unbind(short column)
+    /// \throws index_range_error, database_error
+    void unbind();
+
+    /// \brief Unbind data buffers for specific columns in the result set.
+    ///
+    /// Wraps unbind(short column)
+    ///
+    /// \param column_name string Name of column we wish to unbind.
+    /// \throws index_range_error, database_error
+    void unbind(const string& column_name);
+
+    /// \brief Unbind data buffers for specific columns in the result set.
+    ///
+    /// When a result is constructed, in order to optimize data retrieval,
+    /// we automatically try to bind buffers, except for columns that contain
+    /// long/blob data types.  This method gives the caller the option to unbind
+    /// a specific buffer.  Subsequently, during calls to get(), if there is no
+    /// bound data buffer, we will attempt to retrieve the data using a call
+    /// SQLGetData; this is similar to the route taken for columns hosting long
+    /// or bloby data types.  This is suboptimal from efficiency perspective,
+    /// however may be necessary of the driver we are communicating with does
+    /// not support out-of-order retrieval of long data.
+    ///
+    /// \param column short Zero-based index of column we wish to unbind.
+    /// \throws index_range_error, database_error
+    void unbind(short column);
 
     /// \brief Gets data from the given column of the current rowset.
     ///
@@ -1244,7 +1380,7 @@ public:
     /// \param result The column's value will be written to this parameter.
     /// \throws database_error, index_range_error, type_incompatible_error, null_access_error
     template <class T>
-    void get_ref(const string_type& column_name, T& result) const;
+    void get_ref(const string& column_name, T& result) const;
 
     /// \brief Gets data from the given column by name of the current rowset.
     ///
@@ -1255,7 +1391,7 @@ public:
     /// \param result The column's value will be written to this parameter.
     /// \throws database_error, index_range_error, type_incompatible_error
     template <class T>
-    void get_ref(const string_type& column_name, const T& fallback, T& result) const;
+    void get_ref(const string& column_name, const T& fallback, T& result) const;
 
     /// \brief Gets data from the given column of the current rowset.
     ///
@@ -1281,7 +1417,7 @@ public:
     /// \param column_name column's name.
     /// \throws database_error, index_range_error, type_incompatible_error, null_access_error
     template <class T>
-    T get(const string_type& column_name) const;
+    T get(const string& column_name) const;
 
     /// \brief Gets data from the given column by name of the current rowset.
     ///
@@ -1291,7 +1427,7 @@ public:
     /// \param fallback if value is null, return fallback instead.
     /// \throws database_error, index_range_error, type_incompatible_error
     template <class T>
-    T get(const string_type& column_name, const T& fallback) const;
+    T get(const string& column_name, const T& fallback) const;
 
     /// \brief Returns true if and only if the given column of the current rowset is null.
     ///
@@ -1313,21 +1449,41 @@ public:
     /// \see is_null()
     /// \param column_name column's name.
     /// \throws database_error, index_range_error
-    bool is_null(const string_type& column_name) const;
+    bool is_null(const string& column_name) const;
+
+    /// \brief Returns true if we have bound a buffer to the given column.
+    ///
+    /// Generically, nanodbc will greedily bind buffers to columns in the result
+    /// set.  However, we have also given the user the ability to unbind buffers
+    /// via unbind() forcing nanodbc to retrieve data via SQLGetData.  This
+    /// method returns true if there is a buffer bound to the column.
+    ///
+    /// Columns are numbered from left to right and 0-indexed.
+    /// \param column short position.
+    /// \throws index_range_error
+    bool is_bound(short column) const;
+
+    /// \brief Returns true if we have bound a buffer to the given column.
+    ///
+    /// See is_bound(short column) for details.
+    /// \see is_bound()
+    /// \param column_name column's name.
+    /// \throws index_range_error
+    bool is_bound(const string& column_name) const;
 
     /// \brief Returns the column number of the specified column name.
     ///
     /// Columns are numbered from left to right and 0-indexed.
     /// \param column_name column's name.
     /// \throws index_range_error
-    short column(const string_type& column_name) const;
+    short column(const string& column_name) const;
 
     /// \brief Returns the name of the specified column.
     ///
     /// Columns are numbered from left to right and 0-indexed.
     /// \param column position.
     /// \throws index_range_error
-    string_type column_name(short column) const;
+    string column_name(short column) const;
 
     /// \brief Returns the size of the specified column.
     ///
@@ -1337,7 +1493,7 @@ public:
     long column_size(short column) const;
 
     /// \brief Returns the size of the specified column by name.
-    long column_size(const string_type& column_name) const;
+    long column_size(const string& column_name) const;
 
     /// \brief Returns the number of decimal digits of the specified column.
     ///
@@ -1350,19 +1506,37 @@ public:
     int column_decimal_digits(short column) const;
 
     /// \brief Returns the number of decimal digits of the specified column by name.
-    int column_decimal_digits(const string_type& column_name) const;
+    int column_decimal_digits(const string& column_name) const;
 
     /// \brief Returns a identifying integer value representing the SQL type of this column.
     int column_datatype(short column) const;
 
     /// \brief Returns a identifying integer value representing the SQL type of this column by name.
-    int column_datatype(const string_type& column_name) const;
+    int column_datatype(const string& column_name) const;
+
+    /// \brief Returns data source dependent data type name of this column.
+    ///
+    /// The function calls SQLCoLAttribute with the field attribute SQL_DESC_TYPE_NAME to
+    /// obtain the data type name.
+    /// If the type is unknown, an empty string is returned.
+    /// \note Unlike other column metadata functions (eg. column_datatype()),
+    /// this function cost is an extra ODBC API call.
+    string column_datatype_name(short column) const;
+
+    /// \brief Returns data source dependent data type name of this column by name.
+    ///
+    /// The function calls SQLCoLAttribute with the field attribute SQL_DESC_TYPE_NAME to
+    /// obtain the data type name.
+    /// If the type is unknown, an empty string is returned.
+    /// \note Unlike other column metadata functions (eg. column_datatype()),
+    /// this function cost is an extra ODBC API call.
+    string column_datatype_name(const string& column_name) const;
 
     /// \brief Returns a identifying integer value representing the C type of this column.
     int column_c_datatype(short column) const;
 
     /// \brief Returns a identifying integer value representing the C type of this column by name.
-    int column_c_datatype(const string_type& column_name) const;
+    int column_c_datatype(const string& column_name) const;
 
     /// \brief Returns the next result, e.g. when stored procedure returns multiple result sets.
     bool next_result();
@@ -1396,7 +1570,7 @@ public:
     result_iterator() = default;
 
     /// Create result iterator for a given result set.
-    result_iterator(result& r)
+    explicit result_iterator(result& r)
         : result_(r)
     {
         ++(*this);
@@ -1497,12 +1671,12 @@ public:
     class tables
     {
     public:
-        bool next();                       ///< Move to the next result in the result set.
-        string_type table_catalog() const; ///< Fetch table catalog.
-        string_type table_schema() const;  ///< Fetch table schema.
-        string_type table_name() const;    ///< Fetch table name.
-        string_type table_type() const;    ///< Fetch table type.
-        string_type table_remarks() const; ///< Fetch table remarks.
+        bool next();                  ///< Move to the next result in the result set.
+        string table_catalog() const; ///< Fetch table catalog.
+        string table_schema() const;  ///< Fetch table schema.
+        string table_name() const;    ///< Fetch table name.
+        string table_type() const;    ///< Fetch table type.
+        string table_remarks() const; ///< Fetch table remarks.
 
     private:
         friend class nanodbc::catalog;
@@ -1515,19 +1689,19 @@ public:
     {
     public:
         bool next();                           ///< Move to the next result in the result set.
-        string_type table_catalog() const;     ///< Fetch table catalog.
-        string_type table_schema() const;      ///< Fetch table schema.
-        string_type table_name() const;        ///< Fetch table name.
-        string_type column_name() const;       ///< Fetch column name.
+        string table_catalog() const;          ///< Fetch table catalog.
+        string table_schema() const;           ///< Fetch table schema.
+        string table_name() const;             ///< Fetch table name.
+        string column_name() const;            ///< Fetch column name.
         short data_type() const;               ///< Fetch column data type.
-        string_type type_name() const;         ///< Fetch column type name.
+        string type_name() const;              ///< Fetch column type name.
         long column_size() const;              ///< Fetch column size.
         long buffer_length() const;            ///< Fetch buffer length.
         short decimal_digits() const;          ///< Fetch decimal digits.
         short numeric_precision_radix() const; ///< Fetch numeric precission.
         short nullable() const;                ///< True iff column is nullable.
-        string_type remarks() const;           ///< Fetch column remarks.
-        string_type column_default() const;    ///< Fetch column's default.
+        string remarks() const;                ///< Fetch column remarks.
+        string column_default() const;         ///< Fetch column's default.
         short sql_data_type() const;           ///< Fetch column's SQL data type.
         short sql_datetime_subtype() const;    ///< Fetch datetime subtype of column.
         long char_octet_length() const;        ///< Fetch char octet length.
@@ -1542,7 +1716,7 @@ public:
         /// \note MSDN: This column returns a zero-length string if nullability is unknown.
         ///       ISO rules are followed to determine nullability.
         ///       An ISO SQL-compliant DBMS cannot return an empty string.
-        string_type is_nullable() const;
+        string is_nullable() const;
 
     private:
         friend class nanodbc::catalog;
@@ -1554,11 +1728,11 @@ public:
     class primary_keys
     {
     public:
-        bool next();                       ///< Move to the next result in the result set.
-        string_type table_catalog() const; ///< Fetch table catalog.
-        string_type table_schema() const;  ///< Fetch table schema.
-        string_type table_name() const;    ///< Fetch table name.
-        string_type column_name() const;   ///< Fetch column name.
+        bool next();                  ///< Move to the next result in the result set.
+        string table_catalog() const; ///< Fetch table catalog.
+        string table_schema() const;  ///< Fetch table schema.
+        string table_name() const;    ///< Fetch table name.
+        string column_name() const;   ///< Fetch column name.
 
         /// \brief Column sequence number in the key (starting with 1).
         /// Returns valye of KEY_SEQ column in result set returned by SQLPrimaryKeys.
@@ -1567,7 +1741,7 @@ public:
         /// \brief Primary key name.
         /// NULL if not applicable to the data source.
         /// Returns valye of PK_NAME column in result set returned by SQLPrimaryKeys.
-        string_type primary_key_name() const;
+        string primary_key_name() const;
 
     private:
         friend class nanodbc::catalog;
@@ -1579,15 +1753,15 @@ public:
     class table_privileges
     {
     public:
-        bool next();                       ///< Move to the next result in the result set
-        string_type table_catalog() const; ///< Fetch table catalog.
-        string_type table_schema() const;  ///< Fetch table schema.
-        string_type table_name() const;    ///< Fetch table name.
-        string_type grantor() const;       ///< Fetch name of user who granted the privilege.
-        string_type grantee() const;       ///< Fetch name of user whom the privilege was granted.
-        string_type privilege() const;     ///< Fetch the table privilege.
+        bool next();                  ///< Move to the next result in the result set
+        string table_catalog() const; ///< Fetch table catalog.
+        string table_schema() const;  ///< Fetch table schema.
+        string table_name() const;    ///< Fetch table name.
+        string grantor() const;       ///< Fetch name of user who granted the privilege.
+        string grantee() const;       ///< Fetch name of user whom the privilege was granted.
+        string privilege() const;     ///< Fetch the table privilege.
         /// Fetch indicator whether the grantee is permitted to grant the privilege to other users.
-        string_type is_grantable() const;
+        string is_grantable() const;
 
     private:
         friend class nanodbc::catalog;
@@ -1596,7 +1770,7 @@ public:
     };
 
     /// \brief Creates catalog operating on database accessible through the specified connection.
-    catalog(connection& conn);
+    explicit catalog(connection& conn);
 
     /// \brief Creates result set with catalogs, schemas, tables, or table types.
     ///
@@ -1608,10 +1782,10 @@ public:
     /// All arguments are treated as the Pattern Value Arguments.
     /// Empty string argument is equivalent to passing the search pattern '%'.
     catalog::tables find_tables(
-        const string_type::value_type* table = nullptr,
-        const string_type::value_type* = nullptr,
-        const string_type::value_type* = nullptr,
-        const string_type::value_type* = nullptr);
+        const string& table = string(),
+        const string& type = string(),
+        const string& schema = string(),
+        const string& catalog = string());
 
     /// \brief Creates result set with tables and the privileges associated with each table.
     /// Tables information is obtained by executing `SQLTablePrivileges` function within
@@ -1627,9 +1801,9 @@ public:
     /// \note Due to the fact catalog cannot is not the Pattern Value Argument,
     ///       order of parameters is different than in the other catalog look-up functions.
     catalog::table_privileges find_table_privileges(
-        const string_type& catalog,
-        const string_type& table = string_type(),
-        const string_type& schema = string_type());
+        const string& catalog,
+        const string& table = string(),
+        const string& schema = string());
 
     /// \brief Creates result set with columns in one or more tables.
     ///
@@ -1641,10 +1815,10 @@ public:
     /// All arguments are treated as the Pattern Value Arguments.
     /// Empty string argument is equivalent to passing the search pattern '%'.
     catalog::columns find_columns(
-        const string_type& column = string_type(),
-        const string_type& table = string_type(),
-        const string_type& schema = string_type(),
-        const string_type& catalog = string_type());
+        const string& column = string(),
+        const string& table = string(),
+        const string& schema = string(),
+        const string& catalog = string());
 
     /// \brief Creates result set with columns that compose the primary key of a single table.
     ///
@@ -1655,19 +1829,19 @@ public:
     /// All arguments are treated as the Pattern Value Arguments.
     /// Empty string argument is equivalent to passing the search pattern '%'.
     catalog::primary_keys find_primary_keys(
-        const string_type& table,
-        const string_type& schema = string_type(),
-        const string_type& catalog = string_type());
+        const string& table,
+        const string& schema = string(),
+        const string& catalog = string());
 
     /// \brief Returns names of all catalogs (or databases) available in connected data source.
     ///
     /// Executes `SQLTable` function with `SQL_ALL_CATALOG` as catalog search pattern.
-    std::list<string_type> list_catalogs();
+    std::list<string> list_catalogs();
 
     /// \brief Returns names of all schemas available in connected data source.
     ///
     /// Executes `SQLTable` function with `SQL_ALL_SCHEMAS` as schema search pattern.
-    std::list<string_type> list_schemas();
+    std::list<string> list_schemas();
 
 private:
     connection conn_;
@@ -1698,24 +1872,25 @@ struct driver
     /// \brief Driver attributes.
     struct attribute
     {
-        nanodbc::string_type keyword; ///< Driver keyword attribute.
-        nanodbc::string_type value;   ///< Driver attribute value.
+        nanodbc::string keyword; ///< Driver keyword attribute.
+        nanodbc::string value;   ///< Driver attribute value.
     };
 
-    nanodbc::string_type name;       ///< Driver name.
+    nanodbc::string name;            ///< Driver name.
     std::list<attribute> attributes; ///< List of driver attributes.
 };
 
-struct data_source
+struct datasource
 {
-    nanodbc::string_type name;        ///< Driver name
-    nanodbc::string_type description; ///< Driver description
+    nanodbc::string name;   ///< DSN name.
+    nanodbc::string driver; ///< Driver description.
 };
 
 /// \brief Returns a list of ODBC drivers on your system.
 std::list<driver> list_drivers();
 
-std::list<data_source> list_data_sources();
+/// \brief Returns a list of ODBC data sources on your system.
+std::list<datasource> list_datasources();
 
 /// \brief Immediately opens, prepares, and executes the given query directly on the given
 /// connection.
@@ -1728,8 +1903,7 @@ std::list<data_source> list_data_sources();
 /// \attention You will want to use transactions if you are doing batch operations because it will
 ///            prevent auto commits from occurring after each individual operation is executed.
 /// \see open(), prepare(), execute(), result, transaction
-result
-execute(connection& conn, const string_type& query, long batch_operations = 1, long timeout = 0);
+result execute(connection& conn, const string& query, long batch_operations = 1, long timeout = 0);
 
 /// \brief Opens, prepares, and executes query directly without creating result object.
 /// \param conn The connection where the statement will be executed.
@@ -1742,7 +1916,7 @@ execute(connection& conn, const string_type& query, long batch_operations = 1, l
 /// \see open(), prepare(), execute(), result, transaction
 void just_execute(
     connection& conn,
-    const string_type& query,
+    const string& query,
     long batch_operations = 1,
     long timeout = 0);
 
@@ -1794,7 +1968,7 @@ void just_transact(statement& stmt, long batch_operations);
 /// \param timeout The number in seconds before query timeout. Default is 0 indicating no timeout.
 /// \see open()
 /// \throws database_error, programming_error
-void prepare(statement& stmt, const string_type& query, long timeout = 0);
+void prepare(statement& stmt, const string& query, long timeout = 0);
 
 /// @}
 
